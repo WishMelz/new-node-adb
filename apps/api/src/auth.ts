@@ -1,4 +1,19 @@
-import { CanActivate, Controller, ExecutionContext, Get, Injectable, Module, Post, Body, Req, Res, UnauthorizedException, UseGuards } from '@nestjs/common';
+import {
+  CanActivate,
+  Controller,
+  ExecutionContext,
+  Get,
+  Injectable,
+  Module,
+  Post,
+  Body,
+  Req,
+  Res,
+  UnauthorizedException,
+  UseGuards,
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common';
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -8,7 +23,10 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { loadPassword, settings } from './config';
 
 export const COOKIE = 'adb_session';
-export interface LoginSession { id: string; expiresAt: number }
+export interface LoginSession {
+  id: string;
+  expiresAt: number;
+}
 export type AuthRequest = FastifyRequest & { session: LoginSession };
 
 @Injectable()
@@ -30,19 +48,31 @@ export class AuthService {
     for (const entry of entries) {
       if (!Array.isArray(entry) || entry.length !== 2) throw new Error('Invalid session entry');
       const [key, session] = entry;
-      if (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key) || !session ||
-          typeof session.id !== 'string' || !/^[a-f0-9]{32}$/.test(session.id) || !Number.isSafeInteger(session.expiresAt)) {
+      if (
+        typeof key !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(key) ||
+        !session ||
+        typeof session.id !== 'string' ||
+        !/^[a-f0-9]{32}$/.test(session.id) ||
+        !Number.isSafeInteger(session.expiresAt)
+      ) {
         throw new Error('Invalid session entry');
       }
-      if (session.expiresAt > Date.now()) this.sessions.set(key, { id: session.id, expiresAt: session.expiresAt });
+      if (session.expiresAt > Date.now())
+        this.sessions.set(key, { id: session.id, expiresAt: session.expiresAt });
     }
   }
 
   login(password: string, ip: string) {
     const now = Date.now();
     for (const [key, attempt] of this.failures) if (attempt.until <= now) this.failures.delete(key);
-    const attempt = this.failures.get(ip) || { count: 0, until: now + 15 * 60_000 };
-    if (attempt.count >= 5) throw new UnauthorizedException('尝试次数过多，请 15 分钟后重试');
+    const attempt = this.failures.get(ip) || { count: 0, until: now + settings.loginWindowMinutes * 60_000 };
+    if (attempt.count >= settings.loginMaxAttempts) {
+      throw new HttpException(
+        { message: '尝试次数过多，请稍后重试', retryAfter: Math.ceil((attempt.until - now) / 1000) },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
     if (!timingSafeEqual(scryptSync(password, this.salt, 32), this.passwordHash)) {
       attempt.count += 1;
       this.failures.set(ip, attempt);
@@ -52,7 +82,10 @@ export class AuthService {
     for (const [key, session] of this.sessions) if (session.expiresAt <= now) this.sessions.delete(key);
     if (this.sessions.size >= 100) this.sessions.delete(this.sessions.keys().next().value!);
     const token = randomBytes(32).toString('base64url');
-    const session = { id: randomBytes(16).toString('hex'), expiresAt: now + settings.sessionHours * 3_600_000 };
+    const session = {
+      id: randomBytes(16).toString('hex'),
+      expiresAt: now + settings.sessionHours * 3_600_000,
+    };
     this.sessions.set(this.hash(token), session);
     this.persist();
     return { token, session };
@@ -66,8 +99,12 @@ export class AuthService {
     if (this.sessions.delete(key)) this.persist();
   }
 
-  revoke(token?: string) { if (token && this.sessions.delete(this.hash(token))) this.persist(); }
-  private hash(token: string) { return createHmac('sha256', this.sessionKey).update(token).digest('hex'); }
+  revoke(token?: string) {
+    if (token && this.sessions.delete(this.hash(token))) this.persist();
+  }
+  private hash(token: string) {
+    return createHmac('sha256', this.sessionKey).update(token).digest('hex');
+  }
   private persist() {
     mkdirSync(path.dirname(this.sessionFile), { recursive: true, mode: 0o700 });
     const temporary = `${this.sessionFile}.tmp`;
@@ -96,19 +133,38 @@ class LoginDto {
 class AuthController {
   constructor(private readonly auth: AuthService) {}
 
+  @Get('config')
+  config() {
+    return { mode: 'password', sessionHours: settings.sessionHours };
+  }
+
   @Post('login')
-  login(@Body() body: LoginDto, @Req() request: FastifyRequest, @Res({ passthrough: true }) reply: FastifyReply) {
+  login(
+    @Body() body: LoginDto,
+    @Req() request: FastifyRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
     const { token, session } = this.auth.login(body.password, request.ip);
     reply.setCookie(COOKIE, token, {
-      httpOnly: true, sameSite: 'strict', secure: settings.secureCookie,
-      path: '/', maxAge: settings.sessionHours * 3600,
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: settings.secureCookie,
+      path: '/',
+      maxAge: settings.sessionHours * 3600,
     });
     return { expiresAt: session.expiresAt };
   }
 
-  @Get('session') @UseGuards(AuthGuard)
-  session(@Req() request: AuthRequest) { return { expiresAt: request.session.expiresAt }; }
+  @Get('session')
+  @UseGuards(AuthGuard)
+  session(@Req() request: AuthRequest) {
+    return { expiresAt: request.session.expiresAt };
+  }
 }
 
-@Module({ controllers: [AuthController], providers: [AuthService, AuthGuard], exports: [AuthService, AuthGuard] })
+@Module({
+  controllers: [AuthController],
+  providers: [AuthService, AuthGuard],
+  exports: [AuthService, AuthGuard],
+})
 export class AuthModule {}

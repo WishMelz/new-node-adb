@@ -8,13 +8,19 @@ services:
       NODE_ENV: production
       NODE_OPTIONS: --max-old-space-size=128
       HOST: 0.0.0.0
-      PORT: "23110"
+      PORT: '23110'
       ADB_PATH: /usr/bin/adb
       HOME: /app/.data
-      SESSION_HOURS: "${SESSION_HOURS:-24}"
-      COOKIE_SECURE: "false"
+      SESSION_HOURS: '${SESSION_HOURS:-24}'
+      LOGIN_MAX_ATTEMPTS: '${LOGIN_MAX_ATTEMPTS:-5}'
+      LOGIN_WINDOW_MINUTES: '${LOGIN_WINDOW_MINUTES:-15}'
+      PUBLIC_ORIGIN: '${PUBLIC_ORIGIN:-}'
+      ADMIN_PASSWORD: '${ADMIN_PASSWORD:-}'
+      SCRCPY_VERSION: '${SCRCPY_VERSION:-4.0}'
+      SCRCPY_SERVER_PATH: '${SCRCPY_SERVER_PATH:-/app/vendor/scrcpy-server-v4.0}'
+      COOKIE_SECURE: '${COOKIE_SECURE:-false}'
     ports:
-      - "${BIND_IP:-127.0.0.1}:23110:23110"
+      - '${BIND_IP:-127.0.0.1}:23110:23110'
     volumes:
       - ./.data:/app/.data
     mem_limit: 256m
@@ -26,9 +32,15 @@ services:
       driver: json-file
       options:
         max-size: 5m
-        max-file: "3"
+        max-file: '3'
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:23110/api/health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:23110/api/health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       start_period: 20s

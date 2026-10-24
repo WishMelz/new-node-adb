@@ -27,19 +27,25 @@ describe('live single-pointer touch', () => {
   const size = { width: 576, height: 1280 }
   it('sends down and moves before up, allowing consecutive taps', () => {
     const messages: TouchMessage[] = []
-    const touch = new ScreenTouch(message => { messages.push(message); return true })
+    const touch = new ScreenTouch((message) => {
+      messages.push(message)
+      return true
+    })
     touch.begin(1, { x: 10, y: 20 }, size)
     touch.move(1, { x: 50, y: 70 }, size)
-    expect(messages.map(message => message.action)).toEqual(['down', 'move'])
+    expect(messages.map((message) => message.action)).toEqual(['down', 'move'])
     touch.end(1)
     touch.begin(2, { x: 30, y: 40 }, size)
     touch.end(2)
-    expect(messages.map(message => message.action)).toEqual(['down', 'move', 'up', 'down', 'up'])
+    expect(messages.map((message) => message.action)).toEqual(['down', 'move', 'up', 'down', 'up'])
     expect(messages[2]).toMatchObject({ x: 50, y: 70, screenWidth: 576, screenHeight: 1280 })
   })
   it('ignores secondary pointers and releases on cancellation only once', () => {
     const messages: TouchMessage[] = []
-    const touch = new ScreenTouch(message => { messages.push(message); return true })
+    const touch = new ScreenTouch((message) => {
+      messages.push(message)
+      return true
+    })
     touch.begin(1, { x: 10, y: 20 }, size)
     expect(touch.begin(2, { x: 0, y: 0 }, size)).toBe(false)
     touch.move(2, { x: 100, y: 100 }, size)
@@ -47,14 +53,17 @@ describe('live single-pointer touch', () => {
     touch.cancel()
     touch.cancel()
     touch.end(1)
-    expect(messages.map(message => message.action)).toEqual(['down', 'cancel'])
+    expect(messages.map((message) => message.action)).toEqual(['down', 'cancel'])
   })
   it('cancels on rotation and does not retain failed downs', () => {
     const messages: TouchMessage[] = []
-    const touch = new ScreenTouch(message => { messages.push(message); return true })
+    const touch = new ScreenTouch((message) => {
+      messages.push(message)
+      return true
+    })
     touch.begin(1, { x: 10, y: 20 }, size)
     touch.move(1, { x: 20, y: 10 }, { width: 1280, height: 576 })
-    expect(messages.map(message => message.action)).toEqual(['down', 'cancel'])
+    expect(messages.map((message) => message.action)).toEqual(['down', 'cancel'])
     const failed = new ScreenTouch(() => false)
     expect(failed.begin(1, { x: 10, y: 20 }, size)).toBe(false)
     expect(failed.begin(2, { x: 10, y: 20 }, size)).toBe(false)

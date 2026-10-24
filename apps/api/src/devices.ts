@@ -1,7 +1,21 @@
-import { BadRequestException, Body, Controller, Delete, Get, Injectable, Module, Param, Post, Res, UseGuards } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Injectable,
+  NotFoundException,
+  Module,
+  Param,
+  Patch,
+  Post,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { IsIn, IsInt, IsString, Matches, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsString, Matches, Max, Min, ValidateBy } from 'class-validator';
 import type { FastifyReply } from 'fastify';
 import { AdbService, Device, serialPattern, validateSerial } from './adb';
 import { AuthGuard, AuthModule } from './auth';
@@ -12,6 +26,7 @@ export interface DeviceRecord {
   model: string;
   transport: 'network' | 'usb';
   lastConnectedAt: number;
+  note: string;
 }
 
 @Injectable()
@@ -25,43 +40,84 @@ export class DeviceRecordsService {
     const records: unknown = JSON.parse(readFileSync(this.filename, 'utf8'));
     if (!Array.isArray(records)) throw new Error('Invalid device records');
     for (const record of records) {
-      if (!record || typeof record.serial !== 'string' || !serialPattern.test(record.serial) ||
-          typeof record.model !== 'string' || !['network', 'usb'].includes(record.transport) ||
-          !Number.isSafeInteger(record.lastConnectedAt) || record.lastConnectedAt < 0) throw new Error('Invalid device record');
-      this.records.set(record.serial, { serial: record.serial, model: record.model, transport: record.transport, lastConnectedAt: record.lastConnectedAt });
+      if (
+        !record ||
+        typeof record.serial !== 'string' ||
+        !serialPattern.test(record.serial) ||
+        typeof record.model !== 'string' ||
+        !['network', 'usb'].includes(record.transport) ||
+        !Number.isSafeInteger(record.lastConnectedAt) ||
+        record.lastConnectedAt < 0 ||
+        (record.note !== undefined && typeof record.note !== 'string') ||
+        (typeof record.note === 'string' && [...record.note].length > 120)
+      )
+        throw new Error('Invalid device record');
+      this.records.set(record.serial, {
+        serial: record.serial,
+        model: record.model,
+        transport: record.transport,
+        lastConnectedAt: record.lastConnectedAt,
+        note: record.note ?? '',
+      });
     }
   }
 
-  list() { return [...this.records.values()].sort((first, second) => second.lastConnectedAt - first.lastConnectedAt || first.serial.localeCompare(second.serial)); }
+  list() {
+    return [...this.records.values()].sort(
+      (first, second) =>
+        second.lastConnectedAt - first.lastConnectedAt || first.serial.localeCompare(second.serial),
+    );
+  }
 
   remember(host: string) {
     validateSerial(host);
     const previous = this.records.get(host);
-    this.records.set(host, { serial: host, model: previous?.model || host, transport: 'network', lastConnectedAt: Date.now() });
+    this.records.set(host, {
+      serial: host,
+      model: previous?.model || host,
+      transport: 'network',
+      lastConnectedAt: Date.now(),
+      note: previous?.note ?? '',
+    });
     this.online.add(host);
     this.persist();
   }
 
   observe(devices: Device[]) {
-    const online = devices.filter(device => device.state === 'device' && serialPattern.test(device.serial));
+    const online = devices.filter((device) => device.state === 'device' && serialPattern.test(device.serial));
     let changed = false;
     for (const device of online) {
       const previous = this.records.get(device.serial);
-      if (!this.online.has(device.serial) || (previous && (previous.model !== device.model || previous.transport !== device.transport))) {
+      if (
+        !this.online.has(device.serial) ||
+        (previous && (previous.model !== device.model || previous.transport !== device.transport))
+      ) {
         this.records.set(device.serial, {
-          serial: device.serial, model: device.model, transport: device.transport,
+          serial: device.serial,
+          model: device.model,
+          transport: device.transport,
           lastConnectedAt: this.online.has(device.serial) && previous ? previous.lastConnectedAt : Date.now(),
+          note: previous?.note ?? '',
         });
         changed = true;
       }
     }
-    this.online = new Set(online.map(device => device.serial));
+    this.online = new Set(online.map((device) => device.serial));
     if (changed) this.persist();
   }
 
   remove(serial: string) {
     validateSerial(serial);
     if (this.records.delete(serial)) this.persist();
+  }
+
+  updateNote(serial: string, note: string) {
+    validateSerial(serial);
+    const record = this.records.get(serial);
+    if (!record) return undefined;
+    record.note = note.trim();
+    this.persist();
+    return record;
   }
 
   private persist() {
@@ -72,11 +128,27 @@ export class DeviceRecordsService {
   }
 }
 
-class DeviceDto { @IsString() @Matches(serialPattern) serial!: string; }
+class DeviceDto {
+  @IsString() @Matches(serialPattern) serial!: string;
+}
+class DeviceRecordNoteDto {
+  @IsString()
+  @ValidateBy(
+    {
+      name: 'noteMaxLength',
+      validator: {
+        validate: (value: unknown) => typeof value === 'string' && [...value].length <= 120,
+      },
+    },
+    { message: '备注最多 120 个字符' },
+  )
+  note!: string;
+}
 const hostFormatMessage = '请输入设备地址和端口，例如 192.168.1.10:5555';
 class HostDto {
   @IsString({ message: hostFormatMessage })
-  @Matches(/^(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9a-fA-F:]+\]):\d{1,5}$/, { message: hostFormatMessage }) host!: string;
+  @Matches(/^(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9a-fA-F:]+\]):\d{1,5}$/, { message: hostFormatMessage })
+  host!: string;
 }
 class TapDto extends DeviceDto {
   @IsInt() @Min(0) @Max(16383) x!: number;
@@ -99,20 +171,40 @@ class TextDto extends DeviceDto {
   @IsString() @Matches(/^[A-Za-z0-9 .,?!@_+-]{1,200}$/) text!: string;
 }
 const keyCodes: Record<string, string> = {
-  home: '3', back: '4', recent: '187', wake: '224', sleep: '223', enter: '66', volumeUp: '24', volumeDown: '25',
+  home: '3',
+  back: '4',
+  recent: '187',
+  wake: '224',
+  sleep: '223',
+  enter: '66',
+  volumeUp: '24',
+  volumeDown: '25',
 };
 
-@Controller('devices') @UseGuards(AuthGuard)
+@Controller('devices')
+@UseGuards(AuthGuard)
 class DevicesController {
-  constructor(private readonly adb: AdbService, private readonly records: DeviceRecordsService) {}
+  constructor(
+    private readonly adb: AdbService,
+    private readonly records: DeviceRecordsService,
+  ) {}
   @Get() async list() {
     const devices = await this.adb.devices();
     this.records.observe(devices);
     return devices;
   }
-  @Get('records') listRecords() { return this.records.list(); }
+  @Get('records') listRecords() {
+    return this.records.list();
+  }
   @Delete('records/:serial') removeRecord(@Param('serial') serial: string) {
     this.records.remove(serial);
+    return { ok: true };
+  }
+  @Patch('records/:serial') updateRecordNote(
+    @Param('serial') serial: string,
+    @Body() body: DeviceRecordNoteDto,
+  ) {
+    if (!this.records.updateNote(serial, body.note)) throw new NotFoundException('设备记录不存在');
     return { ok: true };
   }
   @Post('connect') async connect(@Body() body: HostDto) {
@@ -124,7 +216,8 @@ class DevicesController {
     return { message };
   }
   @Post('disconnect') async disconnect(@Body() body: DeviceDto) {
-    if (!body.serial.includes(':') && !body.serial.includes('_tcp')) throw new BadRequestException('USB 设备请直接拔出连接线');
+    if (!body.serial.includes(':') && !body.serial.includes('_tcp'))
+      throw new BadRequestException('USB 设备请直接拔出连接线');
     return { message: await this.adb.text(['disconnect', body.serial]) };
   }
   @Get(':serial/host') async host(@Param('serial') serial: string) {
@@ -145,7 +238,15 @@ class DevicesController {
   }
   @Post('swipe') async swipe(@Body() body: SwipeDto) {
     await this.adb.ready(body.serial);
-    await this.adb.run(['shell', 'input', 'swipe', ...[body.startX, body.startY, body.endX, body.endY, body.duration].map(String)], body.serial);
+    await this.adb.run(
+      [
+        'shell',
+        'input',
+        'swipe',
+        ...[body.startX, body.startY, body.endX, body.endY, body.duration].map(String),
+      ],
+      body.serial,
+    );
     return { ok: true };
   }
   @Post('key') async key(@Body() body: KeyDto) {
@@ -155,7 +256,10 @@ class DevicesController {
   }
   @Post('app') async app(@Body() body: AppDto) {
     await this.adb.ready(body.serial);
-    await this.adb.run(['shell', 'monkey', '-p', body.packageName, '-c', 'android.intent.category.LAUNCHER', '1'], body.serial);
+    await this.adb.run(
+      ['shell', 'monkey', '-p', body.packageName, '-c', 'android.intent.category.LAUNCHER', '1'],
+      body.serial,
+    );
     return { ok: true };
   }
   @Post('text') async text(@Body() body: TextDto) {
@@ -166,5 +270,10 @@ class DevicesController {
   }
 }
 
-@Module({ imports: [AuthModule], providers: [AdbService, DeviceRecordsService], controllers: [DevicesController], exports: [AdbService] })
+@Module({
+  imports: [AuthModule],
+  providers: [AdbService, DeviceRecordsService],
+  controllers: [DevicesController],
+  exports: [AdbService],
+})
 export class DevicesModule {}
