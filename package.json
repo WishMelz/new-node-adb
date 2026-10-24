@@ -1,0 +1,14 @@
+{
+  "name": "adb-console",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"npm run dev -w @adb/api\" \"npm run dev -w @adb/web\"",
+    "build": "npm run build -w @adb/api && npm run build -w @adb/web",
+    "test": "npm run test -w @adb/api && npm run test -w @adb/web",
+    "start": "npm run start -w @adb/api"
+  },
+  "devDependencies": { "concurrently": "^9.2.1" }
+}
