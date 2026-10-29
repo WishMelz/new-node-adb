@@ -6,6 +6,7 @@ import DeviceActionsPanel from '../../components/device/DeviceActionsPanel.vue'
 import DeviceConnectDialog from '../../components/device/DeviceConnectDialog.vue'
 import DeviceToolbar from '../../components/device/DeviceToolbar.vue'
 import DeviceRecordsDrawer from '../../components/device/DeviceRecordsDrawer.vue'
+import ActivityDrawer from '../../components/layout/ActivityDrawer.vue'
 import WorkspaceView from './WorkspaceView.vue'
 
 vi.mock('../../api', async (importOriginal) => ({
@@ -45,6 +46,39 @@ describe('device workspace controls', () => {
     await flushPromises()
     return wrapper
   }
+
+  it('provides accessible close buttons for full-width records and activity drawers', async () => {
+    const global = {
+      plugins: [TDesign],
+      stubs: {
+        TDrawer: { template: '<section><slot name="header" /><slot /></section>' },
+        TDialog: true,
+      },
+    }
+    wrapper = mount(DeviceRecordsDrawer, {
+      props: {
+        visible: true,
+        pendingDelete: null,
+        records: [],
+        loading: false,
+        error: '',
+        deleting: '',
+        saving: '',
+        using: '',
+        busy: false,
+      },
+      global,
+    })
+    await wrapper.get('button[aria-label="关闭已保存设备"]').trigger('click')
+    expect(wrapper.emitted('update:visible')).toEqual([[false]])
+    wrapper.unmount()
+    wrapper = mount(ActivityDrawer, {
+      props: { visible: true, items: [] },
+      global,
+    })
+    await wrapper.get('button[aria-label="关闭操作日志"]').trigger('click')
+    expect(wrapper.emitted('update:visible')).toEqual([[false]])
+  })
 
   it('edits notes in the drawer, keeps failed drafts and closes only after successful saving', async () => {
     const record = { ...device, lastConnectedAt: 1000, note: '测试机', online: true, reconnectable: true }
@@ -204,6 +238,30 @@ describe('device workspace controls', () => {
     expect(api.connectDevice).toHaveBeenLastCalledWith('192.0.2.20:5555')
     expect(dialog.props('visible')).toBe(false)
     expect(view.getComponent(DeviceActionsPanel).props('selectedSerial')).toBe('192.0.2.20:5555')
+  })
+
+  it('selects a newly connected device even while an older refresh is pending', async () => {
+    const view = await workspace()
+    let finishRefresh!: (devices: api.Device[]) => void
+    vi.mocked(api.listDevices).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishRefresh = resolve
+      }),
+    )
+    view.getComponent(DeviceToolbar).vm.$emit('refresh')
+    await flushPromises()
+    const connected = { ...device, serial: '192.0.2.20:5555' }
+    vi.mocked(api.listDevices).mockResolvedValue([device, connected])
+    const dialog = view.getComponent(DeviceConnectDialog)
+    dialog.vm.$emit('update:host', connected.serial)
+    await flushPromises()
+    dialog.vm.$emit('connect')
+    await flushPromises()
+    expect(view.getComponent(DeviceActionsPanel).props('selectedSerial')).toBe(connected.serial)
+    finishRefresh([device])
+    await flushPromises()
+    expect(view.getComponent(DeviceActionsPanel).props('selectedSerial')).toBe(connected.serial)
+    expect(view.getComponent(DeviceToolbar).props('loadingDevice')).toBe(false)
   })
 
   it('shows screenshot and add controls without a running stream and removes the more entry', async () => {

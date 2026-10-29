@@ -1,11 +1,43 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { EnterIcon, LockOnIcon, RefreshIcon } from 'tdesign-icons-vue-next'
+import { nextTick, ref, watch } from 'vue'
+import { ArrowLeftIcon, EnterIcon, LockOnIcon, RefreshIcon } from 'tdesign-icons-vue-next'
 
-defineProps<{ pending: boolean; error: string; sessionHours: number }>()
-const emit = defineEmits<{ login: [password: string]; retry: [] }>()
+const props = defineProps<{
+  pending: boolean
+  error: string
+  sessionHours: number
+  twoFactor?: boolean
+  maxTrustDays?: number
+}>()
+const emit = defineEmits<{
+  login: [password: string]
+  verify: [code: string, days: number]
+  cancel: []
+  retry: []
+}>()
 const password = ref('')
+const code = ref('')
+const remember = ref(false)
+const days = ref(7)
+const passwordInput = ref<HTMLInputElement>()
+const codeInput = ref<HTMLInputElement>()
+watch(
+  () => props.twoFactor,
+  async () => {
+    code.value = ''
+    remember.value = false
+    await nextTick()
+    if (props.twoFactor) codeInput.value?.focus()
+    else passwordInput.value?.focus()
+  },
+)
 function submit() {
+  if (props.pending) return
+  if (props.twoFactor) {
+    emit('verify', code.value, remember.value ? days.value : 0)
+    code.value = ''
+    return
+  }
   emit('login', password.value)
   password.value = ''
 }
@@ -15,37 +47,76 @@ function submit() {
   <main class="login-view">
     <section class="login-panel" aria-labelledby="login-title">
       <div class="login-symbol"><LockOnIcon /></div>
-      <h1 id="login-title">登录手机控制台</h1>
+      <h1 id="login-title">{{ twoFactor ? '双重验证' : '登录手机控制台' }}</h1>
       <form @submit.prevent="submit">
-        <label for="password">访问密码</label>
-        <input
-          id="password"
-          v-model="password"
-          class="password-input"
-          name="password"
-          type="password"
-          autocomplete="current-password"
-          required
-          maxlength="256"
-          :disabled="pending"
-          :aria-invalid="!!error"
-          :aria-describedby="error ? 'login-error' : undefined"
-          autofocus
-        />
+        <template v-if="twoFactor">
+          <label for="verification-code">验证码或恢复码</label>
+          <input
+            id="verification-code"
+            ref="codeInput"
+            v-model.trim="code"
+            class="password-input"
+            name="one-time-code"
+            autocomplete="one-time-code"
+            required
+            minlength="6"
+            maxlength="20"
+            :disabled="pending"
+            :aria-invalid="!!error"
+            :aria-describedby="error ? 'login-error' : undefined"
+          />
+          <div class="remember-row">
+            <label class="remember-label"
+              ><input v-model="remember" type="checkbox" :disabled="pending" />此浏览器免 2FA</label
+            >
+            <label v-if="remember" class="remember-days"
+              ><input
+                v-model.number="days"
+                aria-label="免 2FA 天数"
+                type="number"
+                min="1"
+                :max="maxTrustDays ?? 90"
+                step="1"
+                required
+                :disabled="pending"
+              />天</label
+            >
+          </div>
+        </template>
+        <template v-else>
+          <label for="password">访问密码</label>
+          <input
+            id="password"
+            ref="passwordInput"
+            v-model="password"
+            class="password-input"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            required
+            :disabled="pending"
+            :aria-invalid="!!error"
+            :aria-describedby="error ? 'login-error' : undefined"
+            autofocus
+          />
+        </template>
         <t-button
           theme="primary"
           type="submit"
           size="large"
           block
           :loading="pending"
-          :disabled="!password || pending"
-          ><template #icon><EnterIcon /></template>登录</t-button
+          :disabled="(twoFactor ? !code : !password) || pending"
+          ><template #icon><EnterIcon /></template>{{ twoFactor ? '验证并登录' : '登录' }}</t-button
         >
+        <t-button v-if="twoFactor" variant="text" block :disabled="pending" @click="emit('cancel')">
+          <template #icon><ArrowLeftIcon /></template>返回密码登录
+        </t-button>
       </form>
       <p class="session-duration">会话有效期 {{ sessionHours }} 小时</p>
       <div v-if="error" class="login-feedback">
         <p id="login-error" role="alert" class="login-error">{{ error }}</p>
-        <t-tooltip content="重新检查服务"
+        <t-tooltip v-if="!twoFactor" content="重新检查服务"
           ><t-button
             shape="square"
             variant="text"
@@ -108,6 +179,24 @@ form .t-button {
   font-size: 12px;
   color: var(--muted);
   margin-top: 16px;
+}
+.remember-row,
+.remember-label,
+.remember-days {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.remember-row {
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.remember-days input {
+  width: 64px;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px;
 }
 .login-feedback {
   display: flex;

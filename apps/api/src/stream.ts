@@ -12,6 +12,7 @@ import {
   Param,
   Post,
   Req,
+  UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
@@ -21,15 +22,15 @@ import type { ChildProcess } from 'node:child_process';
 import type { RawData, WebSocket } from 'ws';
 import { IsInt, IsString, Matches, Max, Min } from 'class-validator';
 import { AdbService, serialPattern } from './adb';
-import { AuthGuard, AuthModule, AuthRequest } from './auth';
+import { AuthGuard, AuthModule, AuthRequest, AuthService } from './auth';
 import { settings } from './config';
 import { DevicesModule } from './devices';
 
 class StartStreamDto {
   @IsString() @Matches(serialPattern) serial!: string;
-  @IsInt() @Min(480) @Max(1920) maxSize = 1280;
-  @IsInt() @Min(10) @Max(60) maxFps = 30;
-  @IsInt() @Min(500_000) @Max(12_000_000) bitRate = 4_000_000;
+  @IsInt() @Min(480) @Max(1920) maxSize = settings.streamMaxSize;
+  @IsInt() @Min(10) @Max(60) maxFps = settings.streamMaxFps;
+  @IsInt() @Min(500_000) @Max(12_000_000) bitRate = settings.streamBitRate;
 }
 
 type StreamOptions = Pick<StartStreamDto, 'maxSize' | 'maxFps' | 'bitRate'>;
@@ -116,6 +117,7 @@ export class StreamSession {
   private port: number | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
+  private heartbeatTimer: NodeJS.Timeout | undefined;
   private stopPromise: Promise<void> | undefined;
   private attempts = 0;
   private receivedData = false;
@@ -139,18 +141,22 @@ export class StreamSession {
     await this.adb.ready(this.serial);
     this.deviceSize = await this.adb.size(this.serial);
     try {
+      if (this.stopped) throw new BadRequestException('投屏启动已取消');
       await this.adb.run(
         ['push', settings.scrcpyPath, '/data/local/tmp/adb-console-server.jar'],
         this.serial,
         30_000,
       );
+      if (this.stopped) throw new BadRequestException('投屏启动已取消');
       const port = await this.adb.text(
         ['forward', 'tcp:0', `localabstract:scrcpy_${this.socketId}`],
         this.serial,
       );
-      this.port = Number(port);
-      if (!Number.isInteger(this.port) || this.port < 1 || this.port > 65535)
+      const forwardedPort = Number(port);
+      if (!Number.isInteger(forwardedPort) || forwardedPort < 1 || forwardedPort > 65535)
         throw new BadRequestException('ADB 未返回有效转发端口');
+      this.port = forwardedPort;
+      if (this.stopped) throw new BadRequestException('投屏启动已取消');
       this.process = this.adb.spawn(this.serial, [
         'shell',
         `CLASSPATH=/data/local/tmp/adb-console-server.jar`,
@@ -182,6 +188,7 @@ export class StreamSession {
       this.scheduleIdleStop();
     } catch (error) {
       await this.stop('startup failed');
+      await this.cleanupForward();
       throw error;
     }
   }
@@ -197,6 +204,19 @@ export class StreamSession {
     };
     socket.on('close', detach);
     socket.on('error', detach);
+    let alive = true;
+    socket.on('pong', () => {
+      alive = true;
+    });
+    this.heartbeatTimer = setInterval(() => {
+      if (!alive || socket.readyState !== 1) {
+        void this.stop('viewer heartbeat timed out');
+        return;
+      }
+      alive = false;
+      socket.ping();
+    }, 15_000);
+    this.heartbeatTimer.unref();
     socket.on('message', (data, isBinary) => {
       const event = isBinary ? undefined : parseTouchControl(data);
       if (!event) {
@@ -216,16 +236,25 @@ export class StreamSession {
       createdAt: this.createdAt,
       clientCount: this.clients.size,
       started: !this.stopped,
+      options: { ...this.options },
     };
   }
 
-  async stop(_reason: string) {
+  async stop(reason: string) {
     if (this.stopped) return this.stopPromise;
     this.stopped = true;
     this.terminated();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    for (const client of this.clients) client.terminate();
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    for (const client of this.clients) {
+      if (reason === 'session replaced' && client.readyState === 1) {
+        client.close(4001, 'session replaced');
+        const timer = setTimeout(() => client.terminate(), 1000);
+        timer.unref();
+        client.once('close', () => clearTimeout(timer));
+      } else client.terminate();
+    }
     this.clients.clear();
     this.tcp?.destroy();
     this.tcp = undefined;
@@ -334,11 +363,12 @@ export class StreamSession {
   }
 
   private broadcast(chunk: Buffer) {
+    const bufferLimit = Math.max(256 * 1024, (this.options.bitRate / 8) * 2);
     for (const client of this.clients) {
       if (client.readyState !== 1) continue;
-      if (client.bufferedAmount > 4 * 1024 * 1024) {
-        client.terminate();
-        continue;
+      if (client.bufferedAmount + chunk.length > bufferLimit) {
+        void this.stop('viewer too slow');
+        return;
       }
       client.send(chunk, { binary: true });
     }
@@ -359,23 +389,50 @@ export class StreamService implements OnModuleDestroy {
   private readonly sessions = new Map<string, StreamSession>();
   private pending: Promise<unknown> = Promise.resolve();
   private shuttingDown = false;
-  constructor(private readonly adb: AdbService) {}
+  constructor(
+    private readonly adb: AdbService,
+    private readonly auth: AuthService,
+  ) {}
 
-  async start(serial: string, authSessionId: string, options: StreamOptions) {
+  async start(
+    serial: string,
+    authSessionId: string,
+    options: StreamOptions = {
+      maxSize: settings.streamMaxSize,
+      maxFps: settings.streamMaxFps,
+      bitRate: settings.streamBitRate,
+    },
+  ) {
     const operation = this.pending.then(async () => {
       if (this.shuttingDown) throw new BadRequestException('服务正在关闭');
+      if (!this.auth.isActive(authSessionId)) throw new UnauthorizedException('登录已失效，请重新登录');
       for (const session of this.sessions.values()) {
         if (session.serial === serial && session.authSessionId !== authSessionId)
           throw new ConflictException('设备正在被其他会话投屏');
       }
+      const otherSessions = [...this.sessions.values()].filter(
+        (session) => session.authSessionId !== authSessionId,
+      );
+      if (otherSessions.length >= settings.streamMaxSessions)
+        throw new ConflictException('投屏数量已达上限，请停止其他投屏后重试');
       for (const session of this.sessions.values())
         if (session.authSessionId === authSessionId) await this.stop(session.id, 'replaced');
-      const session = new StreamSession(serial, authSessionId, this.adb, options, () =>
-        this.sessions.delete(session.id),
+      if (!this.auth.isActive(authSessionId)) throw new UnauthorizedException('登录已失效，请重新登录');
+      const session = new StreamSession(
+        serial,
+        authSessionId,
+        this.adb,
+        {
+          maxSize: Math.min(options.maxSize, settings.streamMaxSize),
+          maxFps: Math.min(options.maxFps, settings.streamMaxFps),
+          bitRate: Math.min(options.bitRate, settings.streamBitRate),
+        },
+        () => this.sessions.delete(session.id),
       );
       this.sessions.set(session.id, session);
       try {
         await session.start();
+        if (!this.auth.isActive(authSessionId)) throw new UnauthorizedException('登录已失效，请重新登录');
         return session;
       } catch (error) {
         await this.stop(session.id, 'startup failed');
@@ -401,10 +458,25 @@ export class StreamService implements OnModuleDestroy {
     this.sessions.delete(id);
     return true;
   }
-  async stopForAuth(authSessionId: string) {
-    await this.pending;
-    for (const session of [...this.sessions.values()])
-      if (session.authSessionId === authSessionId) await this.stop(session.id, 'logout');
+  stopForAuth(authSessionId: string) {
+    return this.stopSessions(
+      [...this.sessions.values()].filter((session) => session.authSessionId === authSessionId),
+      'logout',
+    );
+  }
+  stopInactive() {
+    return this.stopSessions(
+      [...this.sessions.values()].filter((session) => !this.auth.isActive(session.authSessionId)),
+      'session replaced',
+    );
+  }
+  private async stopSessions(sessions: StreamSession[], reason: string) {
+    const operation = Promise.all([
+      this.pending,
+      ...sessions.map((session) => this.stop(session.id, reason)),
+    ]);
+    this.pending = operation.catch(() => {});
+    await operation;
   }
   async onModuleDestroy() {
     this.shuttingDown = true;

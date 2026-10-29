@@ -17,13 +17,16 @@ export function useAuth() {
   const pending = ref(false)
   const error = ref('')
   const sessionHours = ref(24)
+  const challenge = ref<api.TwoFactorChallenge | null>(null)
   let version = 0
   let expiryTimer: ReturnType<typeof setTimeout> | undefined
 
   function expire(message = '登录已过期，请重新登录') {
     version += 1
     clearTimeout(expiryTimer)
+    checking.value = false
     authenticated.value = false
+    challenge.value = null
     error.value = message
   }
 
@@ -34,6 +37,7 @@ export function useAuth() {
       return
     }
     authenticated.value = true
+    challenge.value = null
     error.value = ''
     const schedule = () => {
       const remaining = expiresAt - Date.now()
@@ -68,10 +72,46 @@ export function useAuth() {
     pending.value = true
     error.value = ''
     try {
-      const session = await api.login(password)
-      if (current === version) accept(session.expiresAt)
+      const result = await api.login(password)
+      if (current !== version) return
+      if ('requiresTwoFactor' in result) {
+        challenge.value = result
+        clearTimeout(expiryTimer)
+        expiryTimer = setTimeout(
+          () => expire('验证已过期，请重新输入密码'),
+          Math.max(0, result.expiresAt - Date.now()),
+        )
+      } else accept(result.expiresAt)
     } catch (failure) {
       if (current === version) error.value = authErrorMessage(failure)
+    } finally {
+      pending.value = false
+    }
+  }
+
+  function cancelVerification() {
+    if (pending.value) return
+    version += 1
+    clearTimeout(expiryTimer)
+    challenge.value = null
+    error.value = ''
+  }
+
+  async function verify(code: string, rememberDays: number) {
+    if (!challenge.value || !code || pending.value) return
+    const current = ++version
+    const token = challenge.value.challenge
+    pending.value = true
+    error.value = ''
+    try {
+      const result = await api.verifyLogin(token, code.trim(), rememberDays)
+      if (current === version) accept(result.expiresAt)
+    } catch (failure) {
+      if (current === version)
+        error.value =
+          isAxiosError(failure) && failure.response?.status === 401
+            ? '验证码无效、已使用或验证已过期，请重试或返回密码登录'
+            : authErrorMessage(failure)
     } finally {
       pending.value = false
     }
@@ -94,15 +134,32 @@ export function useAuth() {
     }
   }
 
-  const onExpired = () => expire()
+  const onExpired = () => {
+    if (authenticated.value || checking.value || pending.value) expire()
+  }
+  const onReplaced = () => expire('账号已在其他位置登录，当前连接已断开')
   onMounted(() => {
     window.addEventListener('auth-expired', onExpired)
+    window.addEventListener('auth-replaced', onReplaced)
     void restore()
   })
   onBeforeUnmount(() => {
     version += 1
     clearTimeout(expiryTimer)
     window.removeEventListener('auth-expired', onExpired)
+    window.removeEventListener('auth-replaced', onReplaced)
   })
-  return { authenticated, checking, pending, error, sessionHours, login, logout, restore }
+  return {
+    authenticated,
+    checking,
+    pending,
+    error,
+    sessionHours,
+    challenge,
+    login,
+    verify,
+    cancelVerification,
+    logout,
+    restore,
+  }
 }

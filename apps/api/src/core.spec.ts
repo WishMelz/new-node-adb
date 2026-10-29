@@ -5,16 +5,18 @@ import { EventEmitter, once } from 'node:events';
 import net from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 import { AdbService, parseDevices, parseSize, validateSerial } from './adb';
 import { AuthService } from './auth';
+import { TwoFactorService } from './two-factor';
+import { TOTP } from 'otpauth';
 import { DeviceRecordsService } from './devices';
 import { createApp, originAllowed } from './main';
 import { loadPassword, parseSettings, settings } from './config';
-import { encodeTouchControl, StreamService } from './stream';
+import { encodeTouchControl, StreamService, StreamSession } from './stream';
 
 process.env.ADMIN_PASSWORD = randomBytes(24).toString('hex');
 const sessionDirectory = mkdtempSync(path.join(tmpdir(), 'adb-auth-test-'));
@@ -43,13 +45,100 @@ test('authentication configuration rejects unsafe or unusable values', () => {
   );
   const password = process.env.ADMIN_PASSWORD;
   try {
-    for (const invalid of ['short', 'a'.repeat(257)]) {
-      process.env.ADMIN_PASSWORD = invalid;
-      assert.throws(() => loadPassword(), /12-256/);
+    for (const configured of ['x', 'short', 'a'.repeat(257)]) {
+      process.env.ADMIN_PASSWORD = configured;
+      assert.equal(loadPassword(), configured);
     }
   } finally {
     process.env.ADMIN_PASSWORD = password;
   }
+});
+
+test('bootstrap password accepts any nonempty length', (context) => {
+  const password = process.env.ADMIN_PASSWORD;
+  let contents = '';
+  context.mock.method(fs, 'existsSync', () => true);
+  context.mock.method(fs, 'mkdirSync', () => undefined);
+  context.mock.method(fs, 'readFileSync', () => contents);
+  try {
+    delete process.env.ADMIN_PASSWORD;
+    for (const configured of ['x', 'short', 'a'.repeat(257)]) {
+      contents = `${configured}\r\n`;
+      assert.equal(loadPassword(), configured);
+    }
+    for (const empty of ['', ' \r\n']) {
+      contents = empty;
+      assert.throws(() => loadPassword(), /must not be empty/);
+    }
+  } finally {
+    process.env.ADMIN_PASSWORD = password;
+  }
+});
+
+test('HTTP password authentication accepts short and long passwords without truncation', async () => {
+  const password = process.env.ADMIN_PASSWORD;
+  try {
+    for (const configured of ['x', 'a'.repeat(257)]) {
+      process.env.ADMIN_PASSWORD = configured;
+      const app = await createApp();
+      try {
+        const server = app.getHttpAdapter().getInstance();
+        for (const invalid of ['', null, 123]) {
+          const response = await server.inject({
+            method: 'POST',
+            url: '/api/auth/login',
+            payload: { password: invalid },
+          });
+          assert.equal(response.statusCode, 400);
+        }
+        const wrong = await server.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { password: configured.length > 1 ? configured.slice(0, -1) : 'wrong' },
+        });
+        assert.equal(wrong.statusCode, 401);
+        const login = await server.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { password: configured },
+        });
+        assert.equal(login.statusCode, 201);
+        const setup = await server.inject({
+          method: 'POST',
+          url: '/api/auth/two-factor/setup',
+          headers: { cookie: String(login.headers['set-cookie']).split(';')[0] },
+          payload: { password: configured },
+        });
+        assert.equal(setup.statusCode, 201);
+      } finally {
+        await app.close();
+      }
+    }
+  } finally {
+    process.env.ADMIN_PASSWORD = password;
+  }
+});
+
+test('stream configuration validates resource limits', () => {
+  const defaults = parseSettings({});
+  assert.equal(defaults.streamMaxSize, 1280);
+  assert.equal(defaults.streamMaxFps, 30);
+  assert.equal(defaults.streamBitRate, 3_000_000);
+  assert.equal(defaults.streamMaxSessions, 2);
+  assert.equal(parseSettings({ STREAM_BIT_RATE: '1500000' }).streamBitRate, 1_500_000);
+  for (const environment of [
+    { STREAM_MAX_SIZE: '479' },
+    { STREAM_MAX_SIZE: '1921' },
+    { STREAM_MAX_FPS: '9' },
+    { STREAM_MAX_FPS: '61' },
+    { STREAM_BIT_RATE: '499999' },
+    { STREAM_BIT_RATE: '12000001' },
+    { STREAM_BIT_RATE: 'NaN' },
+    { STREAM_MAX_SESSIONS: '0' },
+    { STREAM_MAX_SESSIONS: '17' },
+    { STREAM_MAX_SESSIONS: '1.5' },
+  ])
+    assert.throws(() => parseSettings(environment));
 });
 
 test('ADB device parsing, override resolution and serial validation', () => {
@@ -76,13 +165,237 @@ test('random sessions, revocation, expiry and login throttling', () => {
   const first = auth.login(process.env.ADMIN_PASSWORD!, 'local');
   const second = auth.login(process.env.ADMIN_PASSWORD!, 'local');
   assert.notEqual(first.token, second.token);
-  assert.equal(auth.find(first.token)?.id, first.session.id);
+  assert.equal(auth.find(first.token), undefined);
+  assert.equal(auth.isActive(first.session.id), false);
+  assert.equal(auth.find(second.token)?.id, second.session.id);
+  assert.equal(auth.isActive(second.session.id), true);
+  assert.throws(() => auth.login('wrong', 'local'));
+  assert.equal(auth.find(second.token)?.id, second.session.id);
+  const restored = new AuthService();
+  assert.equal(restored.find(first.token), undefined);
+  assert.equal(restored.find(second.token)?.id, second.session.id);
   auth.revoke(first.token);
   assert.equal(auth.find(first.token), undefined);
+  assert.equal(auth.find(second.token)?.id, second.session.id);
   second.session.expiresAt = 0;
   assert.equal(auth.find(second.token), undefined);
   for (let attempt = 0; attempt < 5; attempt += 1) assert.throws(() => auth.login('wrong', 'limited'));
   assert.throws(() => auth.login(process.env.ADMIN_PASSWORD!, 'limited'));
+});
+
+test('optional two-factor enrollment, replay prevention, recovery and trusted browser expiry', (context) => {
+  const filename = path.join(sessionDirectory, 'two-factor.json');
+  context.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
+  try {
+    const factor = new TwoFactorService();
+    assert.equal(factor.enabled, false);
+    const setup = factor.begin('owner');
+    assert.equal(factor.enabled, false);
+    const totp = new TOTP({ secret: setup.secret });
+    assert.throws(() => factor.enable('other', totp.generate()));
+    assert.throws(() => factor.enable('owner', 'invalid'));
+    const { recoveryCodes } = factor.enable('owner', totp.generate());
+    assert.equal(factor.verify(totp.generate()), false);
+    assert.equal(recoveryCodes.length, 10);
+    assert.equal(factor.verify(recoveryCodes[0]), true);
+    assert.equal(new TwoFactorService().verify(recoveryCodes[0]), false);
+    context.mock.timers.tick(30_000);
+    assert.equal(factor.verify(totp.generate()), true);
+    assert.equal(new TwoFactorService().verify(totp.generate()), false);
+    const trusted = factor.remember(7);
+    assert.equal(new TwoFactorService().isTrusted(trusted.token), true);
+    const contents = readFileSync(filename, 'utf8');
+    assert.ok(!contents.includes(trusted.token));
+    assert.ok(!contents.includes(recoveryCodes[1]));
+    assert.ok(!contents.includes(process.env.ADMIN_PASSWORD!));
+    assert.equal(factor.isTrusted('forged'), false);
+    assert.throws(() => factor.remember(91));
+    context.mock.timers.setTime(trusted.expiresAt);
+    assert.equal(factor.isTrusted(trusted.token), false);
+    const another = factor.remember(1);
+    factor.revokeTrusted();
+    assert.equal(new TwoFactorService().isTrusted(another.token), false);
+    mkdirSync(`${filename}.tmp`);
+    assert.throws(() => factor.disable());
+    assert.equal(factor.enabled, true);
+    rmSync(`${filename}.tmp`, { recursive: true });
+    factor.disable();
+    assert.equal(new TwoFactorService().enabled, false);
+    const expired = factor.begin('owner');
+    context.mock.timers.setTime(expired.expiresAt);
+    assert.throws(() => factor.enable('owner', new TOTP({ secret: expired.secret }).generate()));
+  } finally {
+    rmSync(filename, { force: true });
+  }
+});
+
+test('two-factor login challenges cannot replace sessions until verification succeeds', (context) => {
+  const filename = path.join(sessionDirectory, 'two-factor.json');
+  context.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
+  try {
+    const factor = new TwoFactorService();
+    const auth = new AuthService(factor);
+    const first = auth.login(process.env.ADMIN_PASSWORD!, 'first');
+    const setup = factor.begin(first.session.id);
+    const { recoveryCodes } = auth.enableFactor(
+      first.session.id,
+      new TOTP({ secret: setup.secret }).generate(),
+      'first',
+    );
+    const challenge = auth.beginLogin(process.env.ADMIN_PASSWORD!, 'next');
+    assert.ok('challenge' in challenge);
+    assert.ok(auth.find(first.token));
+    assert.throws(() => auth.completeLogin(challenge.challenge, 'invalid', 7, 'next'));
+    assert.ok(auth.find(first.token));
+    const second = auth.completeLogin(challenge.challenge, recoveryCodes[0], 7, 'next');
+    assert.equal(auth.find(first.token), undefined);
+    assert.ok(auth.find(second.token));
+    assert.throws(() => auth.completeLogin(challenge.challenge, recoveryCodes[1], 7, 'next'));
+    const trustedToken = second.trusted?.token;
+    assert.ok(trustedToken);
+    assert.throws(() => auth.beginLogin('wrong', 'trusted', trustedToken));
+    const trusted = auth.beginLogin(process.env.ADMIN_PASSWORD!, 'trusted', trustedToken);
+    assert.ok('token' in trusted);
+    const expired = auth.beginLogin(process.env.ADMIN_PASSWORD!, 'expiry');
+    assert.ok('challenge' in expired);
+    context.mock.timers.tick(5 * 60_000);
+    assert.throws(() => auth.completeLogin(expired.challenge, recoveryCodes[1], 0, 'expiry'));
+    const revoked = auth.beginLogin(process.env.ADMIN_PASSWORD!, 'revoked');
+    assert.ok('challenge' in revoked);
+    factor.revokeTrusted();
+    assert.throws(() => auth.completeLogin(revoked.challenge, recoveryCodes[1], 0, 'revoked'));
+    const limited = auth.beginLogin(process.env.ADMIN_PASSWORD!, 'limited-2fa');
+    assert.ok('challenge' in limited);
+    for (let attempt = 0; attempt < 5; attempt += 1)
+      assert.throws(() => auth.completeLogin(limited.challenge, 'invalid', 0, 'limited-2fa'));
+    assert.throws(() => auth.beginLogin(process.env.ADMIN_PASSWORD!, 'limited-2fa'));
+  } finally {
+    rmSync(filename, { force: true });
+  }
+});
+
+test('two-factor HTTP enrollment, trusted cookies, validation, expiry and revocation', async (context) => {
+  const filename = path.join(sessionDirectory, 'two-factor.json');
+  const previousSecure = settings.secureCookie;
+  context.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
+  settings.secureCookie = true;
+  const app = await createApp();
+  const server = app.getHttpAdapter().getInstance();
+  const password = process.env.ADMIN_PASSWORD!;
+  const cookies = (response: { headers: { [key: string]: unknown } }) => {
+    const values = response.headers['set-cookie'];
+    return (Array.isArray(values) ? values : values ? [values] : []).map(String);
+  };
+  const post = (url: string, payload: object, cookie = '') =>
+    server.inject({ method: 'POST', url: `/api/auth/${url}`, payload, headers: { cookie } });
+  try {
+    assert.equal((await post('two-factor/setup', { password })).statusCode, 401);
+    const first = await post('login', { password });
+    const firstCookie = cookies(first)[0].split(';')[0];
+    assert.equal((await post('two-factor/setup', { password: 'wrong' }, firstCookie)).statusCode, 400);
+    const setupResponse = await post('two-factor/setup', { password }, firstCookie);
+    assert.equal(setupResponse.statusCode, 201);
+    assert.equal(setupResponse.headers['cache-control'], 'no-store');
+    const setup = setupResponse.json();
+    assert.match(setup.qrCode, /^data:image\/png;base64,/);
+    assert.match(setup.uri, /^otpauth:\/\/totp\//);
+    const totp = new TOTP({ secret: setup.secret });
+    const enabled = await post('two-factor/enable', { code: totp.generate() }, firstCookie);
+    assert.equal(enabled.statusCode, 201);
+    const recoveryCodes: string[] = enabled.json().recoveryCodes;
+    const challengeResponse = await post('login', { password });
+    const challenge = challengeResponse.json().challenge;
+    assert.equal(challengeResponse.json().requiresTwoFactor, true);
+    assert.equal(challengeResponse.headers['set-cookie'], undefined);
+    assert.equal(
+      (await server.inject({ url: '/api/auth/session', headers: { cookie: firstCookie } })).statusCode,
+      200,
+    );
+    assert.equal((await post('verify', { challenge, code: '000000' })).statusCode, 401);
+    assert.equal(
+      (await server.inject({ url: '/api/auth/session', headers: { cookie: firstCookie } })).statusCode,
+      200,
+    );
+    for (const rememberDays of [-1, 91, 1.5, '7', null])
+      assert.equal(
+        (await post('verify', { challenge, code: recoveryCodes[0], rememberDays })).statusCode,
+        400,
+      );
+    const verified = await post('verify', { challenge, code: recoveryCodes[0], rememberDays: 7 });
+    assert.equal(verified.statusCode, 201);
+    const sessionCookie = cookies(verified)
+      .find((value) => value.startsWith('adb_session='))!
+      .split(';')[0];
+    const trustHeader = cookies(verified).find((value) => value.startsWith('adb_trusted_browser='))!;
+    const trustedCookie = trustHeader.split(';')[0];
+    assert.match(trustHeader, /Max-Age=604800/);
+    assert.match(trustHeader, /HttpOnly/);
+    assert.match(trustHeader, /Secure/);
+    assert.match(trustHeader, /SameSite=Strict/);
+    assert.match(trustHeader, /Path=\/api\/auth/);
+    assert.equal(
+      (await server.inject({ url: '/api/auth/session', headers: { cookie: firstCookie } })).statusCode,
+      401,
+    );
+    assert.equal((await post('verify', { challenge, code: recoveryCodes[1] })).statusCode, 401);
+    const security = await server.inject({
+      url: '/api/auth/two-factor',
+      headers: { cookie: `${sessionCookie}; ${trustedCookie}` },
+    });
+    assert.equal(security.json().trustedBrowsers, 1);
+    assert.equal(security.json().recoveryCodesRemaining, 9);
+    assert.ok(!security.body.includes(setup.secret));
+    assert.equal((await post('two-factor/disable', { password }, sessionCookie)).statusCode, 400);
+    assert.equal((await post('logout', {}, sessionCookie)).statusCode, 201);
+    const remembered = await post('login', { password }, trustedCookie);
+    assert.equal(remembered.statusCode, 201);
+    assert.equal(remembered.json().requiresTwoFactor, undefined);
+    assert.equal(
+      cookies(remembered).some((value) => value.startsWith('adb_trusted_browser=')),
+      false,
+    );
+    assert.equal((await post('login', { password: 'wrong' }, trustedCookie)).statusCode, 401);
+    const currentCookie = cookies(remembered)[0].split(';')[0];
+    const revoked = await post(
+      'two-factor/revoke-trusted',
+      { password, code: recoveryCodes[1] },
+      currentCookie,
+    );
+    assert.equal(revoked.statusCode, 201);
+    const untrusted = await post('login', { password }, trustedCookie);
+    assert.equal(untrusted.json().requiresTwoFactor, true);
+    const newTrust = await post('verify', {
+      challenge: untrusted.json().challenge,
+      code: recoveryCodes[2],
+      rememberDays: 1,
+    });
+    assert.equal(newTrust.statusCode, 201);
+    const expiredTrust = cookies(newTrust)
+      .find((value) => value.startsWith('adb_trusted_browser='))!
+      .split(';')[0];
+    context.mock.timers.tick(86_400_000);
+    const expired = await post('login', { password }, expiredTrust);
+    assert.equal(expired.json().requiresTwoFactor, true);
+    const noTrust = await post('verify', { challenge: expired.json().challenge, code: totp.generate() });
+    assert.equal(noTrust.statusCode, 201);
+    assert.match(
+      cookies(noTrust).find((value) => value.startsWith('adb_trusted_browser='))!,
+      /Max-Age=0/,
+    );
+    const finalCookie = cookies(noTrust)
+      .find((value) => value.startsWith('adb_session='))!
+      .split(';')[0];
+    assert.equal(
+      (await post('two-factor/disable', { password, code: recoveryCodes[3] }, finalCookie)).statusCode,
+      201,
+    );
+    assert.equal(new TwoFactorService().enabled, false);
+    assert.equal((await post('login', { password })).json().requiresTwoFactor, undefined);
+  } finally {
+    await app.close();
+    settings.secureCookie = previousSecure;
+    rmSync(filename, { force: true });
+  }
 });
 
 test('device records persist, deduplicate and retain deletion during polling', (context) => {
@@ -191,6 +504,21 @@ test('sessions last at least 24 hours and survive restarts without persisting cr
   }
 });
 
+test('upgrading a multi-session store keeps only the latest login across restarts', () => {
+  const auth = new AuthService();
+  const first = auth.login(process.env.ADMIN_PASSWORD!, 'legacy-first');
+  const firstEntries = JSON.parse(readFileSync(settings.sessionFile, 'utf8'));
+  const second = auth.login(process.env.ADMIN_PASSWORD!, 'legacy-last');
+  const secondEntries = JSON.parse(readFileSync(settings.sessionFile, 'utf8'));
+  writeFileSync(settings.sessionFile, JSON.stringify([...firstEntries, ...secondEntries]));
+  const restored = new AuthService();
+  assert.equal(restored.find(first.token), undefined);
+  assert.deepEqual(restored.find(second.token), second.session);
+  assert.equal(JSON.parse(readFileSync(settings.sessionFile, 'utf8')).length, 1);
+  assert.equal(new AuthService().find(first.token), undefined);
+  assert.deepEqual(new AuthService().find(second.token), second.session);
+});
+
 test('stream ownership, concurrent replacement, exit cleanup and shutdown', async () => {
   assert.ok(existsSync(settings.scrcpyPath), 'scrcpy server must be installed');
   const processes: EventEmitter[] = [];
@@ -208,7 +536,7 @@ test('stream ownership, concurrent replacement, exit cleanup and shutdown', asyn
       return child as unknown as ChildProcess;
     },
   } as unknown as AdbService;
-  const streams = new StreamService(adb);
+  const streams = new StreamService(adb, { isActive: () => true } as unknown as AuthService);
   const options = { maxSize: 1280, maxFps: 30, bitRate: 4_000_000 };
   try {
     await streams.start('abc', 'owner', options);
@@ -229,6 +557,408 @@ test('stream ownership, concurrent replacement, exit cleanup and shutdown', asyn
   } finally {
     await streams.onModuleDestroy();
   }
+});
+
+test('stream HTTP defaults and limits protect capacity while allowing owner replacement', async (context) => {
+  const previous = {
+    streamMaxSize: settings.streamMaxSize,
+    streamMaxFps: settings.streamMaxFps,
+    streamBitRate: settings.streamBitRate,
+    streamMaxSessions: settings.streamMaxSessions,
+  };
+  Object.assign(settings, {
+    streamMaxSize: 1024,
+    streamMaxFps: 20,
+    streamBitRate: 2_000_000,
+    streamMaxSessions: 2,
+  });
+  const app = await createApp();
+  const launches: string[][] = [];
+  try {
+    const adb = app.get(AdbService);
+    context.mock.method(adb, 'ready', async () => {});
+    context.mock.method(adb, 'size', async () => ({ width: 1080, height: 2400 }));
+    context.mock.method(adb, 'run', async () => {});
+    context.mock.method(adb, 'text', async () => '27190');
+    context.mock.method(adb, 'spawn', (_serial: string, args: string[]) => {
+      launches.push(args);
+      return Object.assign(new EventEmitter(), { kill() {} });
+    });
+    const server = app.getHttpAdapter().getInstance();
+    const auth = app.get(AuthService);
+    const owners = new Map(
+      Array.from({ length: 3 }, (_, index) => [
+        `isolated-token-${index}`,
+        { id: `isolated-owner-${index}`, expiresAt: Date.now() + 60_000 },
+      ]),
+    );
+    context.mock.method(auth, 'find', (token?: string) => owners.get(token || ''));
+    context.mock.method(auth, 'isActive', (id: string) =>
+      [...owners.values()].some((owner) => owner.id === id),
+    );
+    const headers = [...owners.keys()].map((token) => ({ cookie: `adb_session=${token}` }));
+    assert.equal(
+      (await server.inject({ method: 'POST', url: '/api/streams', payload: { serial: 'abc' } })).statusCode,
+      401,
+    );
+    const first = await server.inject({
+      method: 'POST',
+      url: '/api/streams',
+      headers: headers[0],
+      payload: { serial: 'abc' },
+    });
+    assert.equal(first.statusCode, 201);
+    assert.deepEqual(first.json().options, { maxSize: 1024, maxFps: 20, bitRate: 2_000_000 });
+    assert.ok(launches[0].includes('max_size=1024'));
+    assert.ok(launches[0].includes('max_fps=20'));
+    assert.ok(launches[0].includes('video_bit_rate=2000000'));
+    const second = await server.inject({
+      method: 'POST',
+      url: '/api/streams',
+      headers: headers[1],
+      payload: { serial: 'def', maxSize: 1920, maxFps: 60, bitRate: 12_000_000 },
+    });
+    assert.equal(second.statusCode, 201);
+    assert.deepEqual(second.json().options, first.json().options);
+    const rejected = await server.inject({
+      method: 'POST',
+      url: '/api/streams',
+      headers: headers[2],
+      payload: { serial: 'ghi' },
+    });
+    assert.equal(rejected.statusCode, 409);
+    assert.match(rejected.json().message, /上限/);
+    assert.equal(launches.length, 2);
+    const invalid = await server.inject({
+      method: 'POST',
+      url: '/api/streams',
+      headers: headers[0],
+      payload: { serial: 'xyz', bitRate: 0 },
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.ok(app.get(StreamService).get(first.json().id));
+    const replaced = await server.inject({
+      method: 'POST',
+      url: '/api/streams',
+      headers: headers[0],
+      payload: { serial: 'xyz', maxSize: 800, maxFps: 15, bitRate: 1_000_000 },
+    });
+    assert.equal(replaced.statusCode, 201);
+    assert.deepEqual(replaced.json().options, { maxSize: 800, maxFps: 15, bitRate: 1_000_000 });
+    assert.equal(app.get(StreamService).get(first.json().id), undefined);
+    assert.ok(app.get(StreamService).get(second.json().id));
+    const release = await server.inject({
+      method: 'DELETE',
+      url: `/api/streams/${second.json().id}`,
+      headers: headers[1],
+    });
+    assert.equal(release.statusCode, 200);
+    const admitted = await server.inject({
+      method: 'POST',
+      url: '/api/streams',
+      headers: headers[2],
+      payload: { serial: 'ghi' },
+    });
+    assert.equal(admitted.statusCode, 201);
+  } finally {
+    await app.close();
+    Object.assign(settings, previous);
+  }
+});
+
+for (const twoFactor of [false, true]) {
+  test(`login takeover revokes the old cookie, closes its WebSocket and releases the device (2FA=${twoFactor})`, async (context) => {
+    const app = await createApp();
+    const commands: string[][] = [];
+    let killed = 0;
+    let viewer: WebSocket | undefined;
+    try {
+      const adb = app.get(AdbService);
+      context.mock.method(adb, 'ready', async () => {});
+      context.mock.method(adb, 'size', async () => ({ width: 1080, height: 2400 }));
+      context.mock.method(adb, 'run', async (args: string[]) => {
+        commands.push(args);
+      });
+      context.mock.method(adb, 'text', async () => '27190');
+      context.mock.method(adb, 'spawn', () =>
+        Object.assign(new EventEmitter(), {
+          kill() {
+            killed += 1;
+          },
+        }),
+      );
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      const origin = await app.getUrl();
+      const server = app.getHttpAdapter().getInstance();
+      const login = () =>
+        server.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { password: process.env.ADMIN_PASSWORD! },
+        });
+      const first = await login();
+      assert.equal(first.statusCode, 201);
+      const oldHeaders = { cookie: String(first.headers['set-cookie']).split(';')[0] };
+      let recoveryCode = '';
+      if (twoFactor) {
+        const factor = app.get(TwoFactorService);
+        const session = app.get(AuthService).find(oldHeaders.cookie.slice('adb_session='.length))!;
+        const setup = factor.begin(session.id);
+        recoveryCode = factor.enable(session.id, new TOTP({ secret: setup.secret }).generate())
+          .recoveryCodes[0];
+      }
+      const started = await server.inject({
+        method: 'POST',
+        url: '/api/streams',
+        headers: oldHeaders,
+        payload: { serial: 'abc' },
+      });
+      assert.equal(started.statusCode, 201);
+      const oldStream = app.get(StreamService).get(started.json().id)!;
+      viewer = new WebSocket(`${origin.replace('http:', 'ws:')}/ws/streams/${oldStream.id}`, {
+        headers: oldHeaders,
+        origin,
+      });
+      await once(viewer, 'open');
+      const closed = once(viewer, 'close');
+      const failed = await server.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { password: 'wrong' },
+      });
+      assert.equal(failed.statusCode, 401);
+      assert.equal(viewer.readyState, WebSocket.OPEN);
+      assert.equal((await server.inject({ url: '/api/auth/session', headers: oldHeaders })).statusCode, 200);
+      let second = await login();
+      if (twoFactor) {
+        const challenge = second.json().challenge;
+        assert.equal(second.json().requiresTwoFactor, true);
+        assert.equal(second.headers['set-cookie'], undefined);
+        assert.equal(
+          (
+            await server.inject({
+              method: 'POST',
+              url: '/api/auth/verify',
+              payload: { challenge, code: 'invalid' },
+            })
+          ).statusCode,
+          401,
+        );
+        assert.equal(viewer.readyState, WebSocket.OPEN);
+        assert.equal(killed, 0);
+        assert.equal(app.get(StreamService).get(oldStream.id), oldStream);
+        assert.equal(
+          (await server.inject({ url: '/api/auth/session', headers: oldHeaders })).statusCode,
+          200,
+        );
+        second = await server.inject({
+          method: 'POST',
+          url: '/api/auth/verify',
+          payload: { challenge, code: recoveryCode },
+        });
+      }
+      assert.equal(second.statusCode, 201);
+      const newHeaders = { cookie: String(second.headers['set-cookie']).split(';')[0] };
+      const [closeCode, closeReason] = await closed;
+      assert.equal(closeCode, 4001);
+      assert.equal(closeReason.toString(), 'session replaced');
+      assert.equal(killed, 1);
+      assert.equal(oldStream.clients.size, 0);
+      assert.equal(app.get(StreamService).get(oldStream.id), undefined);
+      assert.ok(commands.some((args) => args.join(' ') === 'forward --remove tcp:27190'));
+      assert.ok(commands.every((args) => args[0] !== 'disconnect'));
+      assert.equal((await server.inject({ url: '/api/auth/session', headers: oldHeaders })).statusCode, 401);
+      assert.equal(
+        (await server.inject({ method: 'POST', url: '/api/auth/logout', headers: oldHeaders })).statusCode,
+        401,
+      );
+      assert.equal(
+        (
+          await server.inject({
+            method: 'POST',
+            url: '/api/streams',
+            headers: oldHeaders,
+            payload: { serial: 'abc' },
+          })
+        ).statusCode,
+        401,
+      );
+      assert.equal((await server.inject({ url: '/api/auth/session', headers: newHeaders })).statusCode, 200);
+      const replacement = await server.inject({
+        method: 'POST',
+        url: '/api/streams',
+        headers: newHeaders,
+        payload: { serial: 'abc' },
+      });
+      assert.equal(replacement.statusCode, 201);
+      assert.notEqual(replacement.json().id, oldStream.id);
+    } finally {
+      viewer?.terminate();
+      await app.close();
+      if (twoFactor) rmSync(path.join(sessionDirectory, 'two-factor.json'), { force: true });
+    }
+  });
+}
+
+test('concurrent logins wait for startup cleanup and reject queued requests from replaced sessions', async (context) => {
+  const app = await createApp();
+  const events = new EventEmitter();
+  const commands: string[][] = [];
+  let finishForward!: (value: string) => void;
+  let launches = 0;
+  try {
+    const adb = app.get(AdbService);
+    context.mock.method(adb, 'ready', async () => {});
+    context.mock.method(adb, 'size', async () => ({ width: 1080, height: 2400 }));
+    context.mock.method(adb, 'run', async (args: string[]) => {
+      commands.push(args);
+    });
+    context.mock.method(
+      adb,
+      'text',
+      () =>
+        new Promise<string>((resolve) => {
+          finishForward = resolve;
+          events.emit('forward');
+        }),
+    );
+    context.mock.method(adb, 'spawn', () => {
+      launches += 1;
+      return Object.assign(new EventEmitter(), { kill() {} });
+    });
+    const auth = app.get(AuthService);
+    const streams = app.get(StreamService);
+    const old = auth.login(process.env.ADMIN_PASSWORD!, 'startup-owner');
+    const forwarding = once(events, 'forward');
+    const starting = assert.rejects(streams.start('abc', old.session.id), /取消|失效/);
+    await forwarding;
+    const queued = assert.rejects(streams.start('abc', old.session.id), /失效/);
+    const originalStop = streams.stopInactive.bind(streams);
+    context.mock.method(streams, 'stopInactive', () => {
+      const pending = originalStop();
+      events.emit('takeover');
+      return pending;
+    });
+    const server = app.getHttpAdapter().getInstance();
+    let completed = 0;
+    const login = () =>
+      server
+        .inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { password: process.env.ADMIN_PASSWORD! },
+        })
+        .then((response) => {
+          completed += 1;
+          return response;
+        });
+    const replacing = once(events, 'takeover');
+    const firstLogin = login();
+    await replacing;
+    const replacingAgain = once(events, 'takeover');
+    const lastLogin = login();
+    await replacingAgain;
+    assert.equal(completed, 0);
+    assert.equal(auth.isActive(old.session.id), false);
+    finishForward('27190');
+    const [firstResponse, lastResponse] = await Promise.all([firstLogin, lastLogin]);
+    await Promise.all([starting, queued]);
+    assert.equal(firstResponse.statusCode, 401);
+    assert.equal(firstResponse.headers['set-cookie'], undefined);
+    assert.equal(lastResponse.statusCode, 201);
+    assert.equal(launches, 0);
+    assert.equal(streams.list(old.session.id).length, 0);
+    assert.ok(commands.some((args) => args.join(' ') === 'forward --remove tcp:27190'));
+    context.mock.method(adb, 'text', async () => '27191');
+    const headers = { cookie: String(lastResponse.headers['set-cookie']).split(';')[0] };
+    assert.equal(
+      (await server.inject({ method: 'POST', url: '/api/streams', headers, payload: { serial: 'abc' } }))
+        .statusCode,
+      201,
+    );
+    assert.equal(launches, 1);
+  } finally {
+    finishForward?.('27190');
+    await app.close();
+  }
+});
+
+test('stream heartbeat retains responsive viewers and cleans up silent connections', async (context) => {
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  let pings = 0;
+  let terminated = 0;
+  const session = new StreamSession('abc', 'owner', {} as AdbService, {
+    maxSize: 1280,
+    maxFps: 30,
+    bitRate: 3_000_000,
+  });
+  const viewer = Object.assign(new EventEmitter(), {
+    readyState: 1,
+    ping: () => {
+      pings += 1;
+    },
+    terminate: () => {
+      terminated += 1;
+    },
+  });
+  try {
+    session.attach(viewer as unknown as WebSocket);
+    for (let interval = 0; interval < 3; interval += 1) {
+      context.mock.timers.tick(15_000);
+      viewer.emit('pong');
+      assert.equal(session.summary().started, true);
+    }
+    assert.equal(pings, 3);
+    context.mock.timers.tick(15_000);
+    assert.equal(pings, 4);
+    context.mock.timers.tick(15_000);
+    assert.equal(session.summary().started, false);
+    assert.equal(session.clients.size, 0);
+    assert.equal(terminated, 1);
+    context.mock.timers.tick(60_000);
+    assert.equal(pings, 4);
+    assert.equal(terminated, 1);
+  } finally {
+    await session.stop('test cleanup');
+  }
+});
+
+test('stopping during stream startup cleans up a late ADB forward without spawning scrcpy', async () => {
+  const commands: string[][] = [];
+  let completeForward!: (port: string) => void;
+  let forwarding!: () => void;
+  const forwardStarted = new Promise<void>((resolve) => {
+    forwarding = resolve;
+  });
+  let spawned = false;
+  const adb = {
+    ready: async () => {},
+    size: async () => ({ width: 1080, height: 2400 }),
+    run: async (args: string[]) => {
+      commands.push(args);
+    },
+    text: () =>
+      new Promise<string>((resolve) => {
+        completeForward = resolve;
+        forwarding();
+      }),
+    spawn: () => {
+      spawned = true;
+      return Object.assign(new EventEmitter(), { kill() {} });
+    },
+  } as unknown as AdbService;
+  const session = new StreamSession('abc', 'owner', adb, {
+    maxSize: 1280,
+    maxFps: 30,
+    bitRate: 4_000_000,
+  });
+  const pending = session.start();
+  await forwardStarted;
+  await session.stop('manual');
+  completeForward('27190');
+  await assert.rejects(pending, /取消/);
+  assert.equal(spawned, false);
+  assert.ok(commands.some((args) => args.join(' ') === 'forward --remove tcp:27190'));
 });
 
 test('Nest serves the frontend and API on the same listener without masking missing routes', async () => {
@@ -526,85 +1256,106 @@ test('scrcpy touch control messages encode pointer actions', () => {
   }
 });
 
-test('video handshake, real-time touch transport and disconnect cleanup', { timeout: 8000 }, async () => {
-  const connections: net.Socket[] = [];
-  const packets: Buffer[] = [];
-  const packetEvents = new EventEmitter();
-  const server = net.createServer((connection) => {
-    connections.push(connection);
-    if (connections.length === 1) connection.write(Buffer.from([0]));
-    else {
-      connection.on('data', (data) => {
-        packets.push(data);
-        packetEvents.emit('packet');
+for (const slowViewer of [false, true])
+  test(
+    `video handshake, touch and ${slowViewer ? 'backpressure' : 'disconnect'} cleanup`,
+    { timeout: 8000 },
+    async () => {
+      const connections: net.Socket[] = [];
+      const packets: Buffer[] = [];
+      const packetEvents = new EventEmitter();
+      const server = net.createServer((connection) => {
+        connections.push(connection);
+        if (connections.length === 1) connection.write(Buffer.from([0]));
+        else {
+          connection.on('data', (data) => {
+            packets.push(data);
+            packetEvents.emit('packet');
+          });
+          connections[0].write(Buffer.from([0, 0, 0, 1, 0x67]));
+        }
       });
-      connections[0].write(Buffer.from([0, 0, 0, 1, 0x67]));
-    }
-  });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const port = (server.address() as net.AddressInfo).port;
-  const forwards: string[][] = [];
-  const adb = {
-    ready: async () => {},
-    size: async () => ({ width: 1080, height: 2400 }),
-    run: async (args: string[]) => {
-      forwards.push(args);
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const port = (server.address() as net.AddressInfo).port;
+      const forwards: string[][] = [];
+      const adb = {
+        ready: async () => {},
+        size: async () => ({ width: 1080, height: 2400 }),
+        run: async (args: string[]) => {
+          forwards.push(args);
+        },
+        text: async () => String(port),
+        spawn: (_serial: string, args: string[]) => {
+          assert.ok(args.includes('control=true'));
+          assert.ok(args.indexOf('send_dummy_byte=true') > args.indexOf('raw_stream=true'));
+          return Object.assign(new EventEmitter(), { kill() {} });
+        },
+      } as unknown as AdbService;
+      const streams = new StreamService(adb, { isActive: () => true } as unknown as AuthService);
+      const viewerServer = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+      await once(viewerServer, 'listening');
+      let viewer: WebSocket | undefined;
+      let attachedViewer: WebSocket | undefined;
+      try {
+        const session = await streams.start('abc', 'owner', {
+          maxSize: 1280,
+          maxFps: 30,
+          bitRate: 4_000_000,
+        });
+        viewerServer.on('connection', (client) => {
+          attachedViewer = client;
+          session.attach(client);
+        });
+        viewer = new WebSocket(`ws://127.0.0.1:${(viewerServer.address() as net.AddressInfo).port}`);
+        const ready = new Promise<void>((resolve) =>
+          viewer!.on('message', (data, binary) => {
+            if (!binary && JSON.parse(data.toString()).ready) resolve();
+          }),
+        );
+        const videoData = new Promise<Buffer>((resolve) =>
+          viewer!.on('message', (data, binary) => {
+            if (binary) resolve(data as Buffer);
+          }),
+        );
+        await ready;
+        assert.equal(connections.length, 2);
+        assert.deepEqual(await videoData, Buffer.from([0, 0, 0, 1, 0x67]));
+        const touch = { type: 'touch', pointerId: 1, x: 200, y: 400, screenWidth: 576, screenHeight: 1280 };
+        for (const action of ['down', 'move', 'up'] as const) {
+          const arrived = once(packetEvents, 'packet');
+          viewer.send(JSON.stringify({ ...touch, action }));
+          await arrived;
+        }
+        const bytes = Buffer.concat(packets);
+        assert.equal(bytes.length, 96);
+        assert.deepEqual([bytes[1], bytes[33], bytes[65]], [0, 2, 1]);
+        assert.equal(bytes.readUInt16BE(18), 576);
+        assert.equal(bytes.readUInt16BE(20), 1280);
+        const downArrived = once(packetEvents, 'packet');
+        viewer.send(JSON.stringify({ ...touch, action: 'down' }));
+        await downArrived;
+        const released = once(packetEvents, 'packet');
+        if (slowViewer) {
+          Object.defineProperty(attachedViewer, 'bufferedAmount', {
+            get: () => Math.max(256 * 1024, (session.summary().options.bitRate / 8) * 2),
+          });
+          const closed = once(viewer, 'close');
+          connections[0].write(Buffer.from([0, 0, 0, 1, 0x65]));
+          await closed;
+          assert.equal(streams.get(session.id), undefined);
+        } else viewer.close();
+        await released;
+        assert.equal(Buffer.concat(packets).at(-31), 1);
+        await streams.onModuleDestroy();
+        assert.ok(forwards.some((args) => args[1] === '--remove'));
+      } finally {
+        viewer?.terminate();
+        await streams.onModuleDestroy();
+        for (const connection of connections) connection.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        for (const client of viewerServer.clients) client.terminate();
+        await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
+      }
     },
-    text: async () => String(port),
-    spawn: (_serial: string, args: string[]) => {
-      assert.ok(args.includes('control=true'));
-      assert.ok(args.indexOf('send_dummy_byte=true') > args.indexOf('raw_stream=true'));
-      return Object.assign(new EventEmitter(), { kill() {} });
-    },
-  } as unknown as AdbService;
-  const streams = new StreamService(adb);
-  const viewerServer = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  await once(viewerServer, 'listening');
-  let viewer: WebSocket | undefined;
-  try {
-    const session = await streams.start('abc', 'owner', { maxSize: 1280, maxFps: 30, bitRate: 4_000_000 });
-    viewerServer.on('connection', (client) => session.attach(client));
-    viewer = new WebSocket(`ws://127.0.0.1:${(viewerServer.address() as net.AddressInfo).port}`);
-    const ready = new Promise<void>((resolve) =>
-      viewer!.on('message', (data, binary) => {
-        if (!binary && JSON.parse(data.toString()).ready) resolve();
-      }),
-    );
-    const videoData = new Promise<Buffer>((resolve) =>
-      viewer!.on('message', (data, binary) => {
-        if (binary) resolve(data as Buffer);
-      }),
-    );
-    await ready;
-    assert.equal(connections.length, 2);
-    assert.deepEqual(await videoData, Buffer.from([0, 0, 0, 1, 0x67]));
-    const touch = { type: 'touch', pointerId: 1, x: 200, y: 400, screenWidth: 576, screenHeight: 1280 };
-    for (const action of ['down', 'move', 'up'] as const) {
-      const arrived = once(packetEvents, 'packet');
-      viewer.send(JSON.stringify({ ...touch, action }));
-      await arrived;
-    }
-    const bytes = Buffer.concat(packets);
-    assert.equal(bytes.length, 96);
-    assert.deepEqual([bytes[1], bytes[33], bytes[65]], [0, 2, 1]);
-    assert.equal(bytes.readUInt16BE(18), 576);
-    assert.equal(bytes.readUInt16BE(20), 1280);
-    const downArrived = once(packetEvents, 'packet');
-    viewer.send(JSON.stringify({ ...touch, action: 'down' }));
-    await downArrived;
-    const released = once(packetEvents, 'packet');
-    viewer.close();
-    await released;
-    assert.equal(Buffer.concat(packets).at(-31), 1);
-    await streams.onModuleDestroy();
-    assert.ok(forwards.some((args) => args[1] === '--remove'));
-  } finally {
-    viewer?.terminate();
-    await streams.onModuleDestroy();
-    for (const connection of connections) connection.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    for (const client of viewerServer.clients) client.terminate();
-    await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
-  }
-});
+  );

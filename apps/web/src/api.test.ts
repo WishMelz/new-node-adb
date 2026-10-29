@@ -1,6 +1,29 @@
-import { describe, expect, it } from 'vitest'
-import { AxiosError } from 'axios'
+import { describe, expect, it, vi } from 'vitest'
+import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios'
 import { connectionErrorMessage, normalizeDeviceHost } from './api'
+
+describe('stream configuration', () => {
+  it('leaves encoding defaults to the server', async () => {
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ({
+      data: { id: 'test-stream' },
+      status: 201,
+      statusText: 'Created',
+      headers: {},
+      config,
+    }))
+    const original = axios.defaults.adapter
+    axios.defaults.adapter = adapter
+    try {
+      vi.resetModules()
+      const configuredApi = await import('./api')
+      const result = await configuredApi.startStream('test-device')
+      expect(JSON.parse(adapter.mock.calls[0]![0].data)).toEqual({ serial: 'test-device' })
+      expect(result.id).toBe('test-stream')
+    } finally {
+      axios.defaults.adapter = original
+    }
+  })
+})
 
 describe('network device address', () => {
   it.each([

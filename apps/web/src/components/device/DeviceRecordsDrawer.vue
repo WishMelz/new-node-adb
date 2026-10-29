@@ -63,7 +63,15 @@ function saveNote(record: DeviceRecord) {
 </script>
 
 <template>
-  <t-drawer v-model:visible="visible" header="已保存设备" :footer="false" size="min(440px, 100vw)">
+  <t-drawer v-model:visible="visible" :footer="false" size="min(440px, 100vw)">
+    <template #header>
+      <div class="drawer-header">
+        <span>已保存设备</span>
+        <t-button shape="square" variant="text" aria-label="关闭已保存设备" @click="visible = false">
+          <template #icon><CloseIcon /></template>
+        </t-button>
+      </div>
+    </template>
     <div class="records-toolbar">
       <span>{{ records.length }} 台设备</span
       ><t-tooltip content="刷新记录"

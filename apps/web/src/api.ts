@@ -19,13 +19,17 @@ export interface StreamSummary {
   clientCount: number
   started: boolean
   deviceSize?: { width: number; height: number }
+  options?: { maxSize: number; maxFps: number; bitRate: number }
 }
 
 const http = axios.create({ baseURL: '/api', timeout: 30_000, withCredentials: true })
 http.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401 && !['/auth/login', '/auth/session'].includes(error.config?.url))
+    if (
+      error.response?.status === 401 &&
+      !['/auth/login', '/auth/verify', '/auth/session'].includes(error.config?.url)
+    )
       window.dispatchEvent(new Event('auth-expired'))
     return Promise.reject(error)
   },
@@ -34,8 +38,42 @@ http.interceptors.response.use(
 export async function authConfig() {
   return (await http.get<{ mode: 'password'; sessionHours: number }>('/auth/config')).data
 }
+export interface TwoFactorChallenge {
+  requiresTwoFactor: true
+  challenge: string
+  expiresAt: number
+  maxTrustDays: number
+}
+export interface SecurityStatus {
+  enabled: boolean
+  maxTrustDays: number
+  trustedBrowsers: number
+  trustedUntil: number | null
+  recoveryCodesRemaining: number
+}
+export interface FactorSetup {
+  secret: string
+  uri: string
+  qrCode: string
+  expiresAt: number
+}
 export async function login(password: string) {
-  return (await http.post<{ expiresAt: number }>('/auth/login', { password })).data
+  return (await http.post<{ expiresAt: number } | TwoFactorChallenge>('/auth/login', { password })).data
+}
+export async function verifyLogin(challenge: string, code: string, rememberDays: number) {
+  return (await http.post<{ expiresAt: number }>('/auth/verify', { challenge, code, rememberDays })).data
+}
+export async function securityStatus() {
+  return (await http.get<SecurityStatus>('/auth/two-factor')).data
+}
+export async function setupTwoFactor(password: string) {
+  return (await http.post<FactorSetup>('/auth/two-factor/setup', { password })).data
+}
+export async function enableTwoFactor(code: string) {
+  return (await http.post<{ recoveryCodes: string[] }>('/auth/two-factor/enable', { code })).data
+}
+export async function changeTwoFactor(action: 'disable' | 'revoke-trusted', password: string, code: string) {
+  return http.post(`/auth/two-factor/${action}`, { password, code })
 }
 export async function session() {
   return (await http.get<{ expiresAt: number }>('/auth/session')).data
@@ -117,9 +155,7 @@ export async function inputText(serial: string, text: string) {
   return http.post('/devices/text', { serial, text })
 }
 export async function startStream(serial: string) {
-  return (
-    await http.post<StreamSummary>('/streams', { serial, maxSize: 1280, maxFps: 30, bitRate: 4_000_000 })
-  ).data
+  return (await http.post<StreamSummary>('/streams', { serial })).data
 }
 export async function listStreams() {
   return (await http.get<StreamSummary[]>('/streams')).data

@@ -71,11 +71,10 @@ export function useStream(
       return
     }
     loading.value = true
-    let version = generation
+    const version = generation + 1
     try {
       await stop()
-      version = generation
-      if (disposed || !ready.value) return
+      if (disposed || version !== generation || !ready.value) return
       const selected = serial.value
       const stream = await api.startStream(selected)
       if (disposed || version !== generation || selected !== serial.value) {
@@ -96,7 +95,7 @@ export function useStream(
       muxer = new JMuxer({
         node: video,
         mode: 'video',
-        fps: 30,
+        fps: stream.options?.maxFps ?? 30,
         flushingTime: 0,
         maxDelay: 200,
         clearBuffer: true,
@@ -116,7 +115,14 @@ export function useStream(
           fail()
         }
       }
-      socket.onclose = fail
+      socket.onclose = (event) => {
+        if (disposed || version !== generation) return
+        if (event.code === 4001) {
+          generation += 1
+          cleanup()
+          window.dispatchEvent(new Event('auth-replaced'))
+        } else fail()
+      }
       socket.onerror = fail
       playbackTimer = setTimeout(fail, 20_000)
       log(`开始控制：${selected}`)
@@ -146,7 +152,7 @@ export function useStream(
       setTimeout(() => URL.revokeObjectURL(url), 1000)
       log('截图已下载')
     } catch (error) {
-      if (!disposed) showError(error, '截图失败')
+      if (!disposed && version === generation && selected === serial.value) showError(error, '截图失败')
     } finally {
       loadingScreen.value = false
     }

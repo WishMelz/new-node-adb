@@ -29,24 +29,26 @@ export function useDevices(
       : '未连接设备',
   )
   let disposed = false
+  let refreshVersion = 0
   watch(host, () => {
     hostError.value = ''
   })
 
-  async function refresh(select: (value: string) => Promise<void>) {
-    if (loading.value || disposed) return
+  async function refresh(select: (value: string) => Promise<void>, force = false) {
+    if ((loading.value && !force) || disposed) return
+    const version = ++refreshVersion
     loading.value = true
     try {
       const result = await api.listDevices()
-      if (disposed) return
+      if (disposed || version !== refreshVersion) return
       devices.value = result
       if (!result.some((device) => device.serial === selectedSerial.value && device.state === 'device')) {
         await select(result.find((device) => device.state === 'device')?.serial || '')
       }
     } catch (error) {
-      if (!disposed) showError(error, '设备列表读取失败')
+      if (!disposed && version === refreshVersion) showError(error, '设备列表读取失败')
     } finally {
-      loading.value = false
+      if (version === refreshVersion) loading.value = false
     }
   }
 

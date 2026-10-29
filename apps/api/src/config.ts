@@ -34,6 +34,10 @@ export function parseSettings(environment: NodeJS.ProcessEnv) {
     sessionHours: integer('SESSION_HOURS', 24, 24, 8760),
     loginMaxAttempts: integer('LOGIN_MAX_ATTEMPTS', 5, 1, 100),
     loginWindowMinutes: integer('LOGIN_WINDOW_MINUTES', 15, 1, 1440),
+    streamMaxSize: integer('STREAM_MAX_SIZE', 1280, 480, 1920),
+    streamMaxFps: integer('STREAM_MAX_FPS', 30, 10, 60),
+    streamBitRate: integer('STREAM_BIT_RATE', 3_000_000, 500_000, 12_000_000),
+    streamMaxSessions: integer('STREAM_MAX_SESSIONS', 2, 1, 16),
   };
 }
 
@@ -47,18 +51,13 @@ export const settings = {
 };
 
 export function loadPassword(): string {
-  if (process.env.ADMIN_PASSWORD) {
-    if (process.env.ADMIN_PASSWORD.length < 12 || process.env.ADMIN_PASSWORD.length > 256)
-      throw new Error('ADMIN_PASSWORD must contain 12-256 characters');
-    return process.env.ADMIN_PASSWORD;
-  }
+  if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
   const directory = path.join(root, '.data');
   const filename = path.join(directory, 'bootstrap-password');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (!existsSync(filename))
     writeFileSync(filename, randomBytes(24).toString('base64url'), { flag: 'wx', mode: 0o600 });
   const password = readFileSync(filename, 'utf8').trim();
-  if (password.length < 12 || password.length > 256)
-    throw new Error('Invalid bootstrap password: expected 12-256 characters');
+  if (!password) throw new Error('Invalid bootstrap password: must not be empty');
   return password;
 }

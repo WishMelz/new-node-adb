@@ -14,6 +14,7 @@ import { useStream } from '../stream/useStream'
 import { useActivity } from '../../composables/useActivity'
 import { useWorkspace } from '../../composables/useWorkspace'
 
+const props = defineProps<{ securityOpen?: boolean }>()
 const activity = reactive(useActivity())
 const connectOpen = ref(false)
 const recordsOpen = ref(false)
@@ -21,7 +22,9 @@ const logsOpen = ref(false)
 const packageName = ref('')
 const input = ref('')
 const usingRecord = ref('')
-const interactionBlocked = computed(() => connectOpen.value || recordsOpen.value || logsOpen.value)
+const interactionBlocked = computed(
+  () => props.securityOpen || connectOpen.value || recordsOpen.value || logsOpen.value,
+)
 const deviceState = useDevices(activity.log, activity.showError)
 const devices = reactive(deviceState)
 const streamState = useStream(
@@ -47,9 +50,9 @@ const connectionLabel = computed(() => {
   return devices.selected ? `设备状态：${devices.selected.state}` : '请连接设备'
 })
 
-async function refreshDevices() {
-  if (disposed || devices.loading || devices.switching) return
-  await devices.refresh(selectDevice)
+async function refreshDevices(force = false) {
+  if (disposed || (!force && devices.loading) || devices.switching) return
+  await devices.refresh(selectDevice, force)
   if (!disposed) await records.refresh()
 }
 
@@ -83,7 +86,7 @@ async function selectDevice(value: unknown) {
 }
 
 async function connect() {
-  const connected = await devices.connect(refreshDevices, selectDevice)
+  const connected = await devices.connect(() => refreshDevices(true), selectDevice)
   if (connected && !disposed) {
     recordsOpen.value = false
     connectOpen.value = false
@@ -101,7 +104,7 @@ async function disconnect() {
     await api.disconnectDevice(serial)
     if (!disposed) {
       activity.log(`已断开 ${serial}`)
-      await refreshDevices()
+      await refreshDevices(true)
     }
   } catch (error) {
     if (!disposed) activity.showError(error, '断开失败')
