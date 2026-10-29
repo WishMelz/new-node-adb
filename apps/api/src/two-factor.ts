@@ -150,7 +150,7 @@ export class TwoFactorService {
 
   private totp(secret: string) {
     return new TOTP({
-      issuer: 'ADB Control Room',
+      issuer: 'ADB Desk',
       label: 'admin',
       algorithm: 'SHA1',
       digits: 6,

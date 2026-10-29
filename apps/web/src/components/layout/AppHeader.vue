@@ -7,7 +7,7 @@ defineEmits<{ logout: []; security: [] }>()
 
 <template>
   <header class="topbar">
-    <div class="brand-lockup"><DesktopIcon /><strong>手机远程控制</strong><span>ADB Control Room</span></div>
+    <div class="brand-lockup"><DesktopIcon /><strong>ADB Desk</strong><span>安卓控制台</span></div>
     <div v-if="authenticated" class="topbar-actions">
       <t-tooltip content="安全设置"
         ><t-button shape="square" variant="text" aria-label="安全设置" @click="$emit('security')"

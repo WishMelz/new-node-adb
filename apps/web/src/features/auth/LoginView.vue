@@ -47,7 +47,7 @@ function submit() {
   <main class="login-view">
     <section class="login-panel" aria-labelledby="login-title">
       <div class="login-symbol"><LockOnIcon /></div>
-      <h1 id="login-title">{{ twoFactor ? '双重验证' : '登录手机控制台' }}</h1>
+      <h1 id="login-title">{{ twoFactor ? '双重验证' : '登录 ADB Desk' }}</h1>
       <form @submit.prevent="submit">
         <template v-if="twoFactor">
           <label for="verification-code">验证码或恢复码</label>

@@ -191,7 +191,10 @@ test('optional two-factor enrollment, replay prevention, recovery and trusted br
     assert.equal(factor.enabled, false);
     const setup = factor.begin('owner');
     assert.equal(factor.enabled, false);
-    const totp = new TOTP({ secret: setup.secret });
+    const uri = new URL(setup.uri);
+    assert.equal(uri.searchParams.get('issuer'), 'ADB Desk');
+    assert.equal(decodeURIComponent(uri.pathname), '/ADB Desk:admin');
+    const totp = new TOTP({ secret: setup.secret, issuer: 'ADB Control Room', label: 'admin' });
     assert.throws(() => factor.enable('other', totp.generate()));
     assert.throws(() => factor.enable('owner', 'invalid'));
     const { recoveryCodes } = factor.enable('owner', totp.generate());

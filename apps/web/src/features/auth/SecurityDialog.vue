@@ -84,13 +84,13 @@ async function submit() {
 }
 
 function download() {
-  const blob = new Blob(['ADB Control Room recovery codes\n\n', recoveryCodes.value.join('\n')], {
+  const blob = new Blob(['ADB Desk recovery codes\n\n', recoveryCodes.value.join('\n')], {
     type: 'text/plain',
   })
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = 'adb-recovery-codes.txt'
+  link.download = 'adb-desk-recovery-codes.txt'
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

@@ -1,5 +1,8 @@
 FROM node:22.23.4-slim
 
+LABEL org.opencontainers.image.title="ADB Desk" \
+    org.opencontainers.image.description="Self-hosted Android web control console powered by ADB and scrcpy"
+
 ENV NODE_ENV=production
 WORKDIR /app
 

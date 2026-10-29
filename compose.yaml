@@ -1,6 +1,8 @@
+name: adb-desk
+
 services:
-  adb-console:
-    image: new-node-adb:local
+  adb-desk:
+    image: adb-desk:local
     build: .
     init: true
     restart: unless-stopped

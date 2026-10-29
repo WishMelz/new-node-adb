@@ -7,6 +7,7 @@ import * as api from '../../api'
 import { authErrorMessage, useAuth } from './useAuth'
 import LoginView from './LoginView.vue'
 import SecurityDialog from './SecurityDialog.vue'
+import AppHeader from '../../components/layout/AppHeader.vue'
 
 vi.mock('../../api', () => ({
   authConfig: vi.fn(),
@@ -27,6 +28,29 @@ vi.mock('tdesign-vue-next', async (importOriginal) => ({
 function httpError(status: number) {
   return Object.assign(new AxiosError(), { response: { status } })
 }
+
+it('shows ADB Desk branding on the header and login screen', async () => {
+  const header = mount(AppHeader, { props: { authenticated: false }, global: { plugins: [TDesign] } })
+  const login = mount(LoginView, {
+    props: { pending: false, error: '', sessionHours: 24 },
+    global: { plugins: [TDesign] },
+  })
+  try {
+    expect(header.get('.brand-lockup strong').text()).toBe('ADB Desk')
+    expect(header.get('.brand-lockup > span').text()).toBe('安卓控制台')
+    expect(login.get('h1').text()).toBe('登录 ADB Desk')
+    await header.setProps({ authenticated: true })
+    await header.get('button[aria-label="安全设置"]').trigger('click')
+    await header.get('button[aria-label="退出登录"]').trigger('click')
+    expect(header.emitted('security')).toHaveLength(1)
+    expect(header.emitted('logout')).toHaveLength(1)
+    await login.setProps({ twoFactor: true })
+    expect(login.get('h1').text()).toBe('双重验证')
+  } finally {
+    header.unmount()
+    login.unmount()
+  }
+})
 
 describe('authentication lifecycle', () => {
   let wrapper: VueWrapper | undefined
