@@ -71,22 +71,23 @@ COOKIE_SECURE=true
 
 ### Docker 部署
 
-Compose 项目和服务名称均为 `adb-desk`，构建镜像为 `adb-desk:local`；默认容器名为 `adb-desk-adb-desk-1`（可由 `-p` 或 `COMPOSE_PROJECT_NAME` 覆盖项目名）。单独构建镜像时使用 `docker build -t adb-desk:local .`，仍须先完成下述前后端构建。
+Compose 项目和服务名称均为 `adb-desk`，默认使用 Docker Hub 镜像 `wishmelz/adb-desk:latest`，支持 `linux/amd64` 和 `linux/arm64`，Docker 自动选择对应架构；默认容器名为 `adb-desk-adb-desk-1`（可由 `-p` 或 `COMPOSE_PROJECT_NAME` 覆盖项目名）。
 
-先执行 `npm ci` 和 `npm run build`，将源码、构建产物、锁文件、`vendor`、`Dockerfile` 和 `compose.yaml` 一起迁移；不要复制本机 `node_modules`。镜像安装目标架构的生产依赖及 ADB，支持 ARM64。现有 `.data` 可随项目迁移以保留访问密码、登录会话和设备记录，不要将其打入镜像或公开分享。
+默认部署只需 `compose.yaml` 和按需配置的 `.env`，无需安装 Node.js 或本地构建。现有 `.data` 可随部署目录迁移以保留访问密码、登录会话和设备记录，不要将其打入镜像或公开分享。如需自行构建，在源码目录依次执行 `npm ci`、`npm run build` 和 `docker build -t adb-desk:local .`，再将 Compose 的 `image` 改为 `adb-desk:local`。
 
 当前 Docker 镜像固定使用 Node.js `22.23.4-slim`。镜像构建时不写入管理员密码；端口和密码在容器启动时通过环境变量定义：
 
 ```powershell
 $env:PORT = '23120'
 $env:ADMIN_PASSWORD = '请替换为自己的非空密码'
-docker compose up -d --build adb-desk
+docker compose pull adb-desk
+docker compose up -d adb-desk
 ```
 
 上述配置会将宿主机 `23120` 映射到容器 `23120`。也可以在项目根目录 `.env` 中设置 `PORT`、`ADMIN_PASSWORD` 和可选的 `BIND_IP`，再执行 Compose 命令。修改密码或端口后需要重新创建容器：
 
 ```powershell
-docker compose up -d --build --force-recreate adb-desk
+docker compose up -d --force-recreate adb-desk
 ```
 
 不要把真实密码写入 `Dockerfile`、镜像构建参数或提交到 Git；`.env` 已被忽略，密码也可以由部署平台的 Secret 注入。
@@ -97,19 +98,21 @@ docker compose up -d --build --force-recreate adb-desk
 mkdir -p .data
 chown -R 1000:1000 .data
 chmod 700 .data
-docker compose build adb-desk
+docker compose pull adb-desk
 docker compose up -d --wait adb-desk
 ```
 
+更新到最新镜像时，再次执行 `docker compose pull adb-desk` 和 `docker compose up -d --wait adb-desk`。
+
 默认只发布 `127.0.0.1:23110`；受信局域网部署可在服务器 `.env` 中设置 `BIND_IP=192.168.3.11` 等实际网卡地址。此配置采用 HTTP，不应新增公网转发；公网访问需另行配置 HTTPS/VPN。容器以非 root 用户运行，设置自动重启、健康检查、日志轮转和 256 MiB 内存上限。用 `docker compose logs --tail 100 adb-desk` 查看日志，`docker compose restart adb-desk` 重启，`docker compose down` 停止但保留 `.data`。
 
-从旧版 `adb-console` 服务 / `new-node-adb:local` 镜像升级时，先在原部署目录、使用旧 Compose 文件和原项目名执行 `docker compose down`（不要添加 `-v`），再更新配置和构建产物，执行 `docker compose up -d --build --wait adb-desk`。若原部署使用了 `-p` 或 `COMPOSE_PROJECT_NAME`，停止旧容器时也必须使用同一项目名。不要直接启动第二套服务，否则旧容器可能继续占用端口；保留原 `.data` 绑定目录和 `.env`，密码、2FA、设备记录及 ADB 密钥无需迁移格式。已有验证器条目可能仍显示旧名称，但验证码继续有效；新绑定显示 `ADB Desk`。
+从旧版 `adb-console` 服务 / `new-node-adb:local` 镜像升级时，先在原部署目录、使用旧 Compose 文件和原项目名执行 `docker compose down`（不要添加 `-v`），再更新配置，依次执行 `docker compose pull adb-desk` 和 `docker compose up -d --wait adb-desk`。若原部署使用了 `-p` 或 `COMPOSE_PROJECT_NAME`，停止旧容器时也必须使用同一项目名。不要直接启动第二套服务，否则旧容器可能继续占用端口；保留原 `.data` 绑定目录和 `.env`，密码、2FA、设备记录及 ADB 密钥无需迁移格式。已有验证器条目可能仍显示旧名称，但验证码继续有效；新绑定显示 `ADB Desk`。
 
 容器内 ADB 与宿主机 ADB 隔离，当前部署针对网络设备连接，不接管现有 ADB 服务、USB 设备或已有连接。首次连接手机可能需重新授权；ADB 密钥保存在 `.data/.android`，容器重建后保留。需要 USB 时应单独配置设备访问权限，不能仅靠本配置发现宿主机 USB。
 
 ### 方案一：R2S + FRP
 
-推荐将生产项目、ADB 和 scrcpy 转发运行在 R2S，公网服务器只运行 Nginx 和 frps。视频由手机编码，R2S 不转码；ADB 连接与启动控制都留在家庭局域网。优先在开发电脑构建前后端，再在 R2S 构建 ARM64 运行镜像，避免在路由器上运行 Vite 或 TypeScript 编译任务。
+推荐将生产项目、ADB 和 scrcpy 转发运行在 R2S，公网服务器只运行 Nginx 和 frps。视频由手机编码，R2S 不转码；ADB 连接与启动控制都留在家庭局域网。R2S 可直接通过上述 Compose 命令拉取 ARM64 发布镜像，无需在路由器上构建前后端或镜像。
 
 ```text
 浏览器 HTTPS/WSS

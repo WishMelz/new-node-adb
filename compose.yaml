@@ -2,8 +2,7 @@ name: adb-desk
 
 services:
   adb-desk:
-    image: adb-desk:local
-    build: .
+    image: wishmelz/adb-desk:latest
     init: true
     restart: unless-stopped
     environment:
