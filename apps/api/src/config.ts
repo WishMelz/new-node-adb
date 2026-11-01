@@ -14,22 +14,15 @@ export function parseSettings(environment: NodeJS.ProcessEnv) {
     }
     return value;
   }
-  const origin = environment.PUBLIC_ORIGIN || '';
-  if (origin) {
-    const parsed = new URL(origin);
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== origin) {
-      throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin without a path or credentials');
-    }
-  }
   const secureCookie = environment.COOKIE_SECURE || 'false';
   if (!['true', 'false'].includes(secureCookie)) throw new Error('COOKIE_SECURE must be true or false');
-  if (origin && origin.startsWith('https:') !== (secureCookie === 'true')) {
-    throw new Error('COOKIE_SECURE must match the PUBLIC_ORIGIN protocol');
-  }
+  const production = environment.NODE_ENV === 'production';
+  const dataDir = path.resolve(root, environment.DATA_DIR || '.data');
   return {
-    host: environment.HOST || '127.0.0.1',
-    port: integer('PORT', 23110, 1, 65535),
-    origin,
+    port: integer(production ? 'DOCKER_PORT' : 'DEV_API_PORT', production ? 23120 : 23110, 1, 65535),
+    dataDir,
+    sessionFile: path.join(dataDir, 'sessions.json'),
+    deviceRecordsFile: path.join(dataDir, 'devices.json'),
     secureCookie: secureCookie === 'true',
     sessionHours: integer('SESSION_HOURS', 24, 24, 8760),
     loginMaxAttempts: integer('LOGIN_MAX_ATTEMPTS', 5, 1, 100),
@@ -43,8 +36,6 @@ export function parseSettings(environment: NodeJS.ProcessEnv) {
 
 export const settings = {
   ...parseSettings(process.env),
-  sessionFile: path.join(root, '.data/sessions.json'),
-  deviceRecordsFile: path.join(root, '.data/devices.json'),
   adbPath: process.env.ADB_PATH || 'adb',
   scrcpyVersion: process.env.SCRCPY_VERSION || '4.0',
   scrcpyPath: process.env.SCRCPY_SERVER_PATH || path.join(root, 'vendor/scrcpy-server-v4.0'),
@@ -52,7 +43,7 @@ export const settings = {
 
 export function loadPassword(): string {
   if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
-  const directory = path.join(root, '.data');
+  const directory = settings.dataDir;
   const filename = path.join(directory, 'bootstrap-password');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (!existsSync(filename))

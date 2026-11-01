@@ -20,4 +20,8 @@ export default ts.config(
     files: ['**/*.vue'],
     languageOptions: { parserOptions: { parser: ts.parser, extraFileExtensions: ['.vue'] } },
   },
+  {
+    files: ['scripts/docker-smoke.mjs'],
+    rules: { 'preserve-caught-error': 'off' },
+  },
 )

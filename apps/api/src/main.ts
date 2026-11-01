@@ -93,12 +93,6 @@ class AppController {
 @Module({ imports: [AuthModule, DevicesModule, StreamModule], controllers: [AppController] })
 class AppModule {}
 
-export function originAllowed(origin: string | undefined, host: string | undefined) {
-  if (!origin) return true;
-  if (settings.origin) return origin === settings.origin;
-  return origin === `${settings.secureCookie ? 'https' : 'http'}://${host}`;
-}
-
 function scheduleSessionExpiry(callback: () => void, expiresAt: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const schedule = () => {
@@ -125,12 +119,6 @@ export async function createApp(webRoot = path.join(root, 'apps/web/dist')) {
   await server.register(rateLimit, { max: 600, timeWindow: '1 minute' });
   server.addHook('onRequest', async (request, reply) => {
     if (request.url.startsWith('/api/auth/')) reply.header('Cache-Control', 'no-store');
-    if (
-      !['GET', 'HEAD', 'OPTIONS'].includes(request.method) &&
-      !originAllowed(request.headers.origin, request.headers.host)
-    ) {
-      return reply.code(403).send({ message: '请求来源不被允许' });
-    }
   });
   app.setGlobalPrefix('api');
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true }));
@@ -143,8 +131,6 @@ export async function createApp(webRoot = path.join(root, 'apps/web/dist')) {
     try {
       const url = new URL(request.url || '/', `http://${request.headers.host}`);
       const match = url.pathname.match(/^\/ws\/streams\/([^/]+)$/);
-      if (!request.headers.origin || !originAllowed(request.headers.origin, request.headers.host))
-        return socket.destroy();
       const token = server.parseCookie(request.headers.cookie || '')[COOKIE];
       const session = app.get(AuthService).find(token);
       const stream = match ? app.get(StreamService).get(match[1]) : undefined;
@@ -173,7 +159,7 @@ if (require.main === module) {
   void createApp()
     .then(async (app) => {
       app.enableShutdownHooks();
-      await app.listen({ host: settings.host, port: settings.port });
+      await app.listen({ host: '0.0.0.0', port: settings.port });
     })
     .catch((error) => {
       console.error(error);

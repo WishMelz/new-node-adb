@@ -1,13 +1,16 @@
 import {
   BadGatewayException,
   BadRequestException,
+  BeforeApplicationShutdown,
   Injectable,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { execFile, spawn } from 'node:child_process';
+import { ChildProcess, execFile, spawn } from 'node:child_process';
+import net from 'node:net';
 import { promisify } from 'node:util';
 import sharp from 'sharp';
 import { settings } from './config';
+import { adbEnvironment, prepareAdbIdentity } from './adb-identity';
 
 const execute = promisify(execFile);
 export interface Device {
@@ -55,16 +58,128 @@ export function validateSerial(serial: string) {
 }
 
 @Injectable()
-export class AdbService {
+export class AdbService implements BeforeApplicationShutdown {
+  private server?: ChildProcess;
+  private starting?: Promise<void>;
+  private socket?: string;
+  private environment?: NodeJS.ProcessEnv;
+  private closing = false;
+
+  private async ensureServer() {
+    if (this.closing) throw new ServiceUnavailableException('ADB 服务正在关闭');
+    if (!this.starting) {
+      this.starting = this.startServer().catch((error) => {
+        this.starting = undefined;
+        throw error;
+      });
+    }
+    await this.starting;
+    if (this.closing) throw new ServiceUnavailableException('ADB 服务正在关闭');
+  }
+
+  private async startServer() {
+    try {
+      await prepareAdbIdentity(settings.dataDir, settings.adbPath);
+      const reservation = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        reservation.once('error', reject);
+        reservation.listen(0, '127.0.0.1', resolve);
+      });
+      const port = (reservation.address() as net.AddressInfo).port;
+      await new Promise<void>((resolve, reject) =>
+        reservation.close((error) => (error ? reject(error) : resolve())),
+      );
+      if (this.closing) throw new Error('closing');
+      this.socket = `tcp:${port}`;
+      this.environment = adbEnvironment(settings.dataDir);
+      const server = spawn(settings.adbPath, ['-L', this.socket, 'server', 'nodaemon'], {
+        env: this.environment,
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      this.server = server;
+      await new Promise<void>((resolve, reject) => {
+        let timer: ReturnType<typeof setTimeout>;
+        let connection: net.Socket | undefined;
+        let finished = false;
+        const finish = (error?: Error) => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          clearTimeout(deadline);
+          connection?.destroy();
+          if (error) reject(error);
+          else resolve();
+        };
+        const deadline = setTimeout(() => finish(new Error('ADB startup timed out')), 15_000);
+        server.once('error', () => finish(new Error('ADB server failed')));
+        server.once('exit', () => {
+          if (this.server === server) {
+            this.server = undefined;
+            this.socket = undefined;
+            this.starting = undefined;
+          }
+          finish(new Error('ADB server exited'));
+        });
+        const connect = () => {
+          connection = net.connect(port, '127.0.0.1');
+          connection.setTimeout(1000, () => connection?.destroy());
+          let response = '';
+          connection.on('connect', () => connection?.write('000chost:version'));
+          connection.on('data', (chunk) => {
+            response += chunk.toString();
+            if (/^OKAY0004[0-9a-fA-F]{4}$/.test(response)) finish();
+            else if (response.length >= 12) finish(new Error('Unexpected ADB server response'));
+          });
+          connection.on('error', () => {});
+          connection.on('close', () => {
+            if (!finished) timer = setTimeout(connect, 50);
+          });
+        };
+        connect();
+      });
+    } catch {
+      this.server?.kill();
+      this.server = undefined;
+      this.socket = undefined;
+      throw new ServiceUnavailableException(
+        '无法初始化项目 ADB，请检查 ADB_PATH、DATA_DIR 权限及 .android 密钥；不会覆盖已有密钥',
+      );
+    }
+  }
+
+  async beforeApplicationShutdown() {
+    this.closing = true;
+    await this.starting?.catch(() => {});
+    const server = this.server;
+    if (!server || server.exitCode !== null || server.signalCode !== null) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        server.kill('SIGKILL');
+      }, 3000);
+      server.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      server.kill();
+    });
+  }
+
   async run(args: string[], serial?: string, timeout = 15_000) {
     if (serial) validateSerial(serial);
+    await this.ensureServer();
     try {
-      return await execute(settings.adbPath, serial ? ['-s', serial, ...args] : args, {
-        timeout,
-        maxBuffer: 24 * 1024 * 1024,
-        encoding: 'buffer',
-        windowsHide: true,
-      });
+      return await execute(
+        settings.adbPath,
+        ['-H', '127.0.0.1', '-P', this.socket!.slice(4), ...(serial ? ['-s', serial] : []), ...args],
+        {
+          env: this.environment,
+          timeout,
+          maxBuffer: 24 * 1024 * 1024,
+          encoding: 'buffer',
+          windowsHide: true,
+        },
+      );
     } catch (error) {
       const failure = error as { code?: string; killed?: boolean; stderr?: Buffer };
       if (failure.code === 'ENOENT')
@@ -99,7 +214,10 @@ export class AdbService {
   }
   spawn(serial: string, args: string[]) {
     validateSerial(serial);
-    return spawn(settings.adbPath, ['-s', serial, ...args], {
+    if (this.closing || !this.server || !this.socket)
+      throw new ServiceUnavailableException('项目 ADB server 未就绪，请重新连接设备');
+    return spawn(settings.adbPath, ['-H', '127.0.0.1', '-P', this.socket.slice(4), '-s', serial, ...args], {
+      env: this.environment,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

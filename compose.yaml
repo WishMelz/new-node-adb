@@ -5,29 +5,20 @@ services:
     image: wishmelz/adb-desk:latest
     init: true
     restart: unless-stopped
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
     environment:
       NODE_ENV: production
       NODE_OPTIONS: --max-old-space-size=128
-      HOST: 0.0.0.0
-      PORT: '${PORT:-23110}'
+      DATA_DIR: /app/.data
       ADB_PATH: /usr/bin/adb
       HOME: /app/.data
-      SESSION_HOURS: '${SESSION_HOURS:-24}'
-      LOGIN_MAX_ATTEMPTS: '${LOGIN_MAX_ATTEMPTS:-5}'
-      LOGIN_WINDOW_MINUTES: '${LOGIN_WINDOW_MINUTES:-15}'
-      STREAM_MAX_SIZE: '${STREAM_MAX_SIZE:-1280}'
-      STREAM_MAX_FPS: '${STREAM_MAX_FPS:-30}'
-      STREAM_BIT_RATE: '${STREAM_BIT_RATE:-3000000}'
-      STREAM_MAX_SESSIONS: '${STREAM_MAX_SESSIONS:-2}'
-      PUBLIC_ORIGIN: '${PUBLIC_ORIGIN:-}'
-      ADMIN_PASSWORD: '${ADMIN_PASSWORD:-}'
-      SCRCPY_VERSION: '${SCRCPY_VERSION:-4.0}'
-      SCRCPY_SERVER_PATH: '${SCRCPY_SERVER_PATH:-/app/vendor/scrcpy-server-v4.0}'
-      COOKIE_SECURE: '${COOKIE_SECURE:-false}'
-    ports:
-      - '${BIND_IP:-127.0.0.1}:${PORT:-23110}:${PORT:-23110}'
     volumes:
-      - ./.data:/app/.data
+      - type: bind
+        source: '${DATA_DIR:-./.data}'
+        target: /app/.data
     mem_limit: 256m
     security_opt:
       - no-new-privileges:true
@@ -44,7 +35,7 @@ services:
           'CMD',
           'node',
           '-e',
-          "fetch('http://127.0.0.1:${PORT:-23110}/api/health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))",
+          "fetch('http://127.0.0.1:' + (process.env.DOCKER_PORT || '23120') + '/api/health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))",
         ]
       interval: 30s
       timeout: 5s

@@ -14,8 +14,9 @@ import { AuthService } from './auth';
 import { TwoFactorService } from './two-factor';
 import { TOTP } from 'otpauth';
 import { DeviceRecordsService } from './devices';
-import { createApp, originAllowed } from './main';
-import { loadPassword, parseSettings, settings } from './config';
+import { createApp } from './main';
+import { loadPassword, parseSettings, root, settings } from './config';
+import { adbEnvironment, inspectAdbIdentity, prepareAdbIdentity } from './adb-identity';
 import { encodeTouchControl, StreamService, StreamSession } from './stream';
 
 process.env.ADMIN_PASSWORD = randomBytes(24).toString('hex');
@@ -24,25 +25,111 @@ settings.sessionFile = path.join(sessionDirectory, 'sessions.json');
 settings.deviceRecordsFile = path.join(sessionDirectory, 'devices.json');
 after(() => rmSync(sessionDirectory, { recursive: true, force: true }));
 
+test('ADB identity rejects orphaned public keys without replacing them and isolates environment', async () => {
+  const directory = path.join(sessionDirectory, 'adb-orphan');
+  mkdirSync(path.join(directory, '.android'), { recursive: true });
+  const publicFile = path.join(directory, '.android', 'adbkey.pub');
+  writeFileSync(publicFile, 'existing-public-key');
+  await assert.rejects(prepareAdbIdentity(directory, 'must-not-execute-adb'), /without its private key/);
+  assert.equal(readFileSync(publicFile, 'utf8'), 'existing-public-key');
+  assert.equal(existsSync(path.join(directory, '.android', 'adbkey')), false);
+  assert.equal(existsSync(path.join(directory, '.adb-identity.lock')), false);
+  const environment = adbEnvironment(directory);
+  assert.equal(environment.ANDROID_USER_HOME, path.join(directory, '.android'));
+  assert.equal(environment.ADB_VENDOR_KEYS, path.join(directory, '.android', 'adbkey'));
+  assert.equal(environment.HOME, directory);
+  assert.equal(environment.USERPROFILE, directory);
+  assert.equal(environment.ADB_SERVER_SOCKET, undefined);
+  assert.equal(environment.ANDROID_SERIAL, undefined);
+});
+
+test('ADB identity status is read-only and corrupt identities fail closed', async () => {
+  const directory = path.join(sessionDirectory, 'identity-invalid');
+  assert.equal((await inspectAdbIdentity(directory, 'must-not-execute-adb')).initialized, false);
+  assert.equal(existsSync(directory), false);
+  mkdirSync(path.join(directory, '.android'), { recursive: true });
+  const filename = path.join(directory, '.android', 'adbkey');
+  writeFileSync(filename, 'invalid-private-key');
+  await assert.rejects(prepareAdbIdentity(directory, 'must-not-execute-adb'), /Invalid ADB private key/);
+  assert.equal(readFileSync(filename, 'utf8'), 'invalid-private-key');
+});
+
+test('ADB identity status rejects linked directories without following or modifying them', async () => {
+  const directory = path.join(sessionDirectory, 'identity-linked');
+  const target = path.join(sessionDirectory, 'identity-link-target');
+  mkdirSync(directory);
+  mkdirSync(target);
+  fs.symlinkSync(target, path.join(directory, '.android'), process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(inspectAdbIdentity(directory, 'must-not-execute-adb'), /symbolic link/);
+  await assert.rejects(prepareAdbIdentity(directory, 'must-not-execute-adb'), /symbolic link/);
+  assert.deepEqual(fs.readdirSync(target), []);
+  rmSync(target, { recursive: true });
+  await assert.rejects(inspectAdbIdentity(directory, 'must-not-execute-adb'), /symbolic link/);
+  assert.equal(existsSync(target), false);
+});
+
+test(
+  'ADB identity persists and imports using real offline Platform Tools',
+  { skip: !process.env.ADB_TEST_PATH },
+  async () => {
+    const adbPath = process.env.ADB_TEST_PATH!;
+    const source = path.join(sessionDirectory, 'identity-source');
+    const destination = path.join(sessionDirectory, 'identity-destination');
+    const [generated, concurrent] = await Promise.all([
+      prepareAdbIdentity(source, adbPath),
+      prepareAdbIdentity(source, adbPath),
+    ]);
+    assert.equal(concurrent.fingerprint, generated.fingerprint);
+    assert.notEqual(concurrent.created, generated.created);
+    const filename = path.join(source, '.android', 'adbkey');
+    const original = readFileSync(filename);
+    const repeated = await prepareAdbIdentity(source, adbPath);
+    assert.equal(repeated.fingerprint, generated.fingerprint);
+    assert.equal(repeated.created, false);
+    assert.deepEqual(readFileSync(filename), original);
+    const imported = await prepareAdbIdentity(destination, adbPath, filename);
+    assert.equal(imported.fingerprint, generated.fingerprint);
+    assert.equal((await prepareAdbIdentity(destination, adbPath, filename)).created, false);
+    const other = path.join(sessionDirectory, 'identity-other');
+    await prepareAdbIdentity(other, adbPath);
+    await assert.rejects(
+      prepareAdbIdentity(destination, adbPath, path.join(other, '.android', 'adbkey')),
+      /different ADB identity/,
+    );
+    assert.equal((await prepareAdbIdentity(destination, adbPath)).fingerprint, generated.fingerprint);
+    rmSync(`${filename}.pub`);
+    const status = await inspectAdbIdentity(source, adbPath);
+    assert.equal(status.fingerprint, generated.fingerprint);
+    assert.equal(status.publicKeyPresent, false);
+    assert.equal(existsSync(`${filename}.pub`), false);
+    await prepareAdbIdentity(source, adbPath);
+    assert.deepEqual(readFileSync(filename), original);
+    writeFileSync(`${filename}.pub`, 'mismatched-public-key');
+    await assert.rejects(prepareAdbIdentity(source, adbPath), /mismatch/);
+  },
+);
+
 test('authentication configuration rejects unsafe or unusable values', () => {
   assert.equal(parseSettings({}).sessionHours, 24);
+  assert.equal(parseSettings({}).port, 23110);
+  assert.equal('host' in parseSettings({ HOST: '127.0.0.1' }), false);
+  assert.equal(parseSettings({ BACKEND_PORT: '24110', PORT: '25110' }).port, 23110);
+  assert.equal(parseSettings({ BACKEND_PORT: '25110', FRONTEND_PORT: '25111' }).port, 23110);
   assert.equal(parseSettings({ SESSION_HOURS: '168' }).sessionHours, 168);
   for (const environment of [
     { SESSION_HOURS: '23' },
     { SESSION_HOURS: '8761' },
-    { PORT: '65536' },
+    { DEV_API_PORT: '65536' },
+    { DEV_API_PORT: '0' },
+    { DEV_API_PORT: '23110.5' },
+    { DEV_API_PORT: 'invalid' },
     { COOKIE_SECURE: 'yes' },
-    { PUBLIC_ORIGIN: 'https://example.com/' },
-    { PUBLIC_ORIGIN: 'https://example.com' },
     { LOGIN_MAX_ATTEMPTS: '0' },
     { LOGIN_WINDOW_MINUTES: 'NaN' },
-    { PUBLIC_ORIGIN: 'https://user:pass@example.com' },
   ])
     assert.throws(() => parseSettings(environment));
-  assert.equal(
-    parseSettings({ PUBLIC_ORIGIN: 'https://example.com', COOKIE_SECURE: 'true' }).secureCookie,
-    true,
-  );
+  assert.equal(parseSettings({ COOKIE_SECURE: 'true' }).secureCookie, true);
+  assert.equal(parseSettings({ PUBLIC_ORIGIN: 'https://legacy.example.com' }).secureCookie, false);
   const password = process.env.ADMIN_PASSWORD;
   try {
     for (const configured of ['x', 'short', 'a'.repeat(257)]) {
@@ -54,12 +141,38 @@ test('authentication configuration rejects unsafe or unusable values', () => {
   }
 });
 
+test('development and production ports are independent and data paths follow DATA_DIR', () => {
+  assert.equal(parseSettings({ NODE_ENV: 'production' }).port, 23120);
+  assert.equal(parseSettings({ DEV_API_PORT: '', DOCKER_PORT: '' }).port, 23110);
+  assert.equal(parseSettings({ NODE_ENV: 'production', DOCKER_PORT: '' }).port, 23120);
+  assert.equal(parseSettings({ DEV_API_PORT: '24110', DOCKER_PORT: 'invalid' }).port, 24110);
+  assert.equal(
+    parseSettings({ NODE_ENV: 'production', DEV_API_PORT: 'invalid', DOCKER_PORT: '24120' }).port,
+    24120,
+  );
+  for (const value of ['0', '65536', '1.5', 'invalid']) {
+    assert.throws(() => parseSettings({ NODE_ENV: 'production', DOCKER_PORT: value }));
+  }
+  for (const directory of ['', 'runtime-data', path.join(tmpdir(), 'adb-config-data')]) {
+    const configuration = parseSettings({ DATA_DIR: directory });
+    const expected = path.resolve(root, directory || '.data');
+    assert.equal(configuration.dataDir, expected);
+    assert.equal(configuration.sessionFile, path.join(expected, 'sessions.json'));
+    assert.equal(configuration.deviceRecordsFile, path.join(expected, 'devices.json'));
+  }
+});
+
 test('bootstrap password accepts any nonempty length', (context) => {
   const password = process.env.ADMIN_PASSWORD;
+  const dataDir = settings.dataDir;
+  settings.dataDir = path.join(sessionDirectory, 'custom-data');
   let contents = '';
   context.mock.method(fs, 'existsSync', () => true);
   context.mock.method(fs, 'mkdirSync', () => undefined);
-  context.mock.method(fs, 'readFileSync', () => contents);
+  context.mock.method(fs, 'readFileSync', (filename: fs.PathOrFileDescriptor) => {
+    assert.equal(filename, path.join(settings.dataDir, 'bootstrap-password'));
+    return contents;
+  });
   try {
     delete process.env.ADMIN_PASSWORD;
     for (const configured of ['x', 'short', 'a'.repeat(257)]) {
@@ -71,6 +184,7 @@ test('bootstrap password accepts any nonempty length', (context) => {
       assert.throws(() => loadPassword(), /must not be empty/);
     }
   } finally {
+    settings.dataDir = dataDir;
     process.env.ADMIN_PASSWORD = password;
   }
 });
@@ -718,9 +832,21 @@ for (const twoFactor of [false, true]) {
       });
       assert.equal(started.statusCode, 201);
       const oldStream = app.get(StreamService).get(started.json().id)!;
-      viewer = new WebSocket(`${origin.replace('http:', 'ws:')}/ws/streams/${oldStream.id}`, {
+      const socketUrl = `${origin.replace('http:', 'ws:')}/ws/streams/${oldStream.id}`;
+      for (const cookie of ['', 'adb_session=invalid']) {
+        const denied = new WebSocket(socketUrl, {
+          headers: { cookie },
+          origin: 'https://adb.example.com',
+        });
+        try {
+          await assert.rejects(once(denied, 'open'));
+        } finally {
+          denied.terminate();
+        }
+      }
+      viewer = new WebSocket(socketUrl, {
         headers: oldHeaders,
-        origin,
+        ...(twoFactor ? {} : { origin: 'https://adb.example.com' }),
       });
       await once(viewer, 'open');
       const closed = once(viewer, 'close');
@@ -997,7 +1123,7 @@ test('Nest serves the frontend and API on the same listener without masking miss
   }
 });
 
-test('HTTP auth, origin protection and DTO validation', async () => {
+test('HTTP auth through a reverse proxy and DTO validation', async () => {
   let app = await createApp();
   try {
     let server = app.getHttpAdapter().getInstance();
@@ -1010,13 +1136,14 @@ test('HTTP auth, origin protection and DTO validation', async () => {
     const blocked = await server.inject({
       method: 'POST',
       url: '/api/auth/login',
-      headers: { origin: 'https://untrusted.invalid' },
-      payload: { password: process.env.ADMIN_PASSWORD },
+      headers: { origin: 'https://adb.example.com', host: '127.0.0.1:23110' },
+      payload: { password: 'wrong-password' },
     });
-    assert.equal(blocked.statusCode, 403);
+    assert.equal(blocked.statusCode, 401);
     const login = await server.inject({
       method: 'POST',
       url: '/api/auth/login',
+      headers: { origin: 'https://adb.example.com', host: '127.0.0.1:23110' },
       payload: { password: process.env.ADMIN_PASSWORD },
     });
     assert.equal(login.statusCode, 201);
@@ -1069,7 +1196,6 @@ test('HTTP auth, origin protection and DTO validation', async () => {
     server = app.getHttpAdapter().getInstance();
     assert.equal((await server.inject({ url: '/api/auth/session', headers })).statusCode, 401);
     assert.equal((await server.inject('/api/unknown')).statusCode, 404);
-    assert.equal(originAllowed('https://untrusted.invalid', 'localhost'), false);
   } finally {
     await app.close();
   }
@@ -1199,17 +1325,17 @@ test('device record HTTP routes authenticate, save successful connections and de
         await server.inject({
           method: 'DELETE',
           url: `/api/devices/records/${encodeURIComponent(serial)}`,
-          headers: { ...headers, origin: 'https://untrusted.invalid' },
+          headers: { origin: 'https://adb.example.com' },
         })
       ).statusCode,
-      403,
+      401,
     );
     assert.equal(
       (
         await server.inject({
           method: 'DELETE',
           url: `/api/devices/records/${encodeURIComponent(serial)}`,
-          headers,
+          headers: { ...headers, origin: 'https://adb.example.com' },
         })
       ).statusCode,
       200,

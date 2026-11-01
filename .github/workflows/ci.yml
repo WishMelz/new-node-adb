@@ -35,3 +35,9 @@ jobs:
         run: npm test
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org
+      - name: Build Docker image
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 22
+        run: docker build -t adb-desk:ci .
+      - name: Test Docker runtime and host network
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 22
+        run: npm run test:docker -- adb-desk:ci --host
