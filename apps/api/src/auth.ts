@@ -16,14 +16,13 @@ import {
   Res,
 } from '@nestjs/common';
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import { IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import '@fastify/cookie';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { toDataURL } from 'qrcode';
 import { loadPassword, settings } from './config';
 import { MAX_TRUST_DAYS, TRUST_COOKIE, TwoFactorService } from './two-factor';
+import { StorageModule, StorageService } from './storage';
 
 export const COOKIE = 'adb_session';
 export interface LoginSession {
@@ -37,43 +36,19 @@ export class AuthService {
   private readonly salt = randomBytes(32);
   private readonly passwordHash: Buffer;
   private readonly sessionKey: Buffer;
-  private readonly sessionFile = settings.sessionFile;
-  private readonly sessions = new Map<string, LoginSession>();
   private readonly failures = new Map<string, { count: number; until: number }>();
   private readonly challenges = new Map<
     string,
     { ip: string; expiresAt: number; version: string; attempts: number }
   >();
 
-  constructor(private readonly factor: TwoFactorService = new TwoFactorService()) {
+  constructor(
+    private readonly factor: TwoFactorService = new TwoFactorService(),
+    private readonly store: StorageService = factor.store,
+  ) {
     const password = loadPassword();
     this.passwordHash = scryptSync(password, this.salt, 32);
     this.sessionKey = scryptSync(password, 'adb-session-store-v1', 32);
-    if (!existsSync(this.sessionFile)) return;
-    const entries: unknown = JSON.parse(readFileSync(this.sessionFile, 'utf8'));
-    if (!Array.isArray(entries)) throw new Error('Invalid session store');
-    for (const entry of entries) {
-      if (!Array.isArray(entry) || entry.length !== 2) throw new Error('Invalid session entry');
-      const [key, session] = entry;
-      if (
-        typeof key !== 'string' ||
-        !/^[a-f0-9]{64}$/.test(key) ||
-        !session ||
-        typeof session.id !== 'string' ||
-        !/^[a-f0-9]{32}$/.test(session.id) ||
-        !Number.isSafeInteger(session.expiresAt)
-      ) {
-        throw new Error('Invalid session entry');
-      }
-      if (session.expiresAt > Date.now())
-        this.sessions.set(key, { id: session.id, expiresAt: session.expiresAt });
-    }
-    if (this.sessions.size > 1) {
-      const latest = [...this.sessions.entries()].at(-1)!;
-      this.sessions.clear();
-      this.sessions.set(...latest);
-      this.persist();
-    }
   }
 
   login(password: string, ip: string) {
@@ -114,15 +89,26 @@ export class AuthService {
       throw new UnauthorizedException('验证已失效，请重新输入密码');
     }
     challenge.attempts += 1;
-    if (!this.factor.verify(code)) {
-      this.failAttempt(ip);
-      if (challenge.attempts >= 5) this.challenges.delete(key);
-      throw new UnauthorizedException('验证码无效、已使用或已过期');
-    }
+    const result = this.store.transaction(() => {
+      if (!this.factor.verify(code)) {
+        this.failAttempt(ip);
+        if (challenge.attempts >= 5) this.challenges.delete(key);
+        throw new UnauthorizedException('验证码无效、已使用或已过期');
+      }
+      const trusted = days > 0 ? this.factor.remember(days) : undefined;
+      return { ...this.createSession(), trusted };
+    });
     this.challenges.delete(key);
     this.failures.delete(ip);
-    const trusted = days > 0 ? this.factor.remember(days) : undefined;
-    return { ...this.createSession(), trusted };
+    return result;
+  }
+
+  changeFactor(password: string, code: string, ip: string, action: 'disable' | 'revoke-trusted') {
+    this.store.transaction(() => {
+      this.checkSecurity(password, code, ip);
+      if (action === 'disable') this.factor.disable();
+      else this.factor.revokeTrusted();
+    });
   }
 
   checkSecurity(password: string, code: string, ip: string) {
@@ -182,37 +168,42 @@ export class AuthService {
       id: randomBytes(16).toString('hex'),
       expiresAt: Date.now() + settings.sessionHours * 3_600_000,
     };
-    this.sessions.clear();
-    this.sessions.set(this.hash(token), session);
-    this.persist();
+    this.store.transaction((database) => {
+      database.exec('DELETE FROM sessions');
+      database
+        .prepare('INSERT INTO sessions (tokenHash, id, expiresAt) VALUES (?, ?, ?)')
+        .run(this.hash(token), session.id, session.expiresAt);
+    });
     return { token, session };
   }
 
   isActive(sessionId: string) {
-    return [...this.sessions.values()].some(
-      (session) => session.id === sessionId && session.expiresAt > Date.now(),
+    return this.store.read(
+      (database) =>
+        !!database
+          .prepare('SELECT id FROM sessions WHERE id = ? AND expiresAt > ?')
+          .get(sessionId, Date.now()),
     );
   }
 
   find(token?: string): LoginSession | undefined {
     if (!token) return;
-    const key = this.hash(token);
-    const session = this.sessions.get(key);
-    if (session && session.expiresAt > Date.now()) return session;
-    if (this.sessions.delete(key)) this.persist();
+    return this.store.read((database) => {
+      const session = database
+        .prepare('SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND expiresAt > ?')
+        .get(this.hash(token), Date.now());
+      return session ? { id: String(session.id), expiresAt: Number(session.expiresAt) } : undefined;
+    });
   }
 
   revoke(token?: string) {
-    if (token && this.sessions.delete(this.hash(token))) this.persist();
+    if (token)
+      this.store.transaction((database) => {
+        database.prepare('DELETE FROM sessions WHERE tokenHash = ?').run(this.hash(token));
+      });
   }
   private hash(token: string) {
     return createHmac('sha256', this.sessionKey).update(token).digest('hex');
-  }
-  private persist() {
-    mkdirSync(path.dirname(this.sessionFile), { recursive: true, mode: 0o700 });
-    const temporary = `${this.sessionFile}.tmp`;
-    writeFileSync(temporary, JSON.stringify([...this.sessions]), { mode: 0o600 });
-    renameSync(temporary, this.sessionFile);
   }
 }
 
@@ -289,8 +280,7 @@ class AuthController {
     @Req() request: AuthRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
   ) {
-    this.auth.checkSecurity(body.password, body.code || '', request.ip);
-    this.factor.disable();
+    this.auth.changeFactor(body.password, body.code || '', request.ip, 'disable');
     reply.clearCookie(TRUST_COOKIE, { path: '/api/auth' });
     return { ok: true };
   }
@@ -302,14 +292,14 @@ class AuthController {
     @Req() request: AuthRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
   ) {
-    this.auth.checkSecurity(body.password, body.code || '', request.ip);
-    this.factor.revokeTrusted();
+    this.auth.changeFactor(body.password, body.code || '', request.ip, 'revoke-trusted');
     reply.clearCookie(TRUST_COOKIE, { path: '/api/auth' });
     return { ok: true };
   }
 }
 
 @Module({
+  imports: [StorageModule],
   controllers: [AuthController],
   providers: [AuthService, AuthGuard, TwoFactorService],
   exports: [AuthService, AuthGuard],

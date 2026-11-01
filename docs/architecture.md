@@ -12,13 +12,17 @@
 
 - `config.ts`：读取并校验环境变量、会话和 scrcpy 路径。
 - `auth.ts`：单管理员密码、Cookie 会话、会话持久化、登录失败限流和认证 Guard。
+- `storage.ts`：Node 内置 SQLite、同步事务、版本化 schema 及旧 JSON 的一次性事务迁移。
+- `two-factor.ts`：TOTP、恢复码和可信浏览器验证，持久化状态由共享的存储服务管理。
 - `adb.ts`：延迟启动自有前台 ADB server、固定子进程身份环境、参数化调用、设备解析和截图；在投屏销毁后的 shutdown 阶段关闭自有进程。
 - `adb-identity.ts`：所有平台统一使用 `DATA_DIR/.android`，通过官方 ADB 离线命令生成/派生公钥，原子发布、校验及幂等导入，不覆盖已有身份。CLI 提供 `init`、只读 `status` 和显式路径 `import`，不经 HTTP 暴露私钥。
-- `devices.ts`：设备 HTTP API 与设备记录 JSON 持久化。
+- `devices.ts`：设备 HTTP API 与设备记录的 SQLite 查询和更新。
 - `stream.ts`：scrcpy server 生命周期、TCP 转发、H.264 视频和控制通道。
 - `main.ts`：Nest/Fastify 应用、Helmet、静态资源和 WebSocket upgrade。
 
-认证令牌只存在于 HttpOnly Cookie；`.data/sessions.json` 保存令牌摘要而不是明文令牌。管理员密码变化会使旧会话失效。WebSocket upgrade 必须通过 Cookie、会话和投屏归属校验，不按 Origin 限制。
+认证令牌只存在于 HttpOnly Cookie；`DATA_DIR/adb-desk.sqlite` 的 `sessions` 表保存令牌摘要而不是明文令牌，`devices` 表保存设备记录，`two_factor` 表保存单管理员 2FA 状态。管理员密码变化会使旧会话失效。WebSocket upgrade 必须通过 Cookie、会话和投屏归属校验，不按 Origin 限制。
+
+业务持久化状态不在内存中保留第二份副本。共享 `StorageService` 使用短连接、`BEGIN IMMEDIATE` 和 `synchronous=FULL`，同一同步调用链内的事务共用连接，提交失败则回滚；事务回调不得异步。2FA 消费、可信浏览器签发和会话替换作为一个事务提交。数据库使用默认 rollback journal，不启用 WAL。`PRAGMA user_version` 标记 schema 版本，首次建表及旧 JSON 导入在同一事务完成，导入成功后保留旧文件但不再读写。升级、备份和回退限制见 [SQLite 存储与升级](../README.md#sqlite-存储与升级)。
 
 ## Web
 
@@ -35,8 +39,8 @@
 
 ## 生命周期
 
-登录后挂载工作台，初始化时停止旧投屏并刷新设备和记录。设备切换会停止当前投屏；工作台卸载、页面隐藏、失焦或会话过期时会取消触控并释放投屏资源。服务端注销先撤销会话，再停止该会话拥有的投屏。
+登录后挂载工作台，初始化时停止旧投屏并刷新设备和记录。设备切换会停止当前投屏；工作台卸载、页面隐藏、失焦或会话过期时会取消触控并释放投屏资源。服务端注销尝试撤销会话，无论数据库撤销是否成功都会清理投屏；撤销失败返回错误，保留 Cookie 和一致的数据库状态以便重试，成功后才清除 Cookie。
 
 ## 部署边界
 
-Docker 使用预构建模式：宿主机执行 `npm ci` 和 `npm run build`，镜像只安装 API 生产依赖并复制构建产物和 vendor。`DATA_DIR` 通过卷挂载保存密码、会话和设备记录。该项目不负责管理宿主机 USB 权限，也不实现多用户租约或音频传输。
+Docker 使用预构建模式：宿主机执行 `npm ci` 和 `npm run build`，镜像只安装 API 生产依赖并复制构建产物和 vendor。`DATA_DIR` 通过卷挂载保存数据库、初始密码和 ADB 身份。SQLite 不改变单实例边界：登录挑战、限流、设备在线状态和投屏仍在进程内，不能多实例共享数据目录。该项目不负责管理宿主机 USB 权限，也不实现多用户租约或音频传输。

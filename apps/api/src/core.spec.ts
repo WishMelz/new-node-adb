@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { after, test } from 'node:test';
+import { after, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import net from 'node:net';
@@ -18,11 +18,13 @@ import { createApp } from './main';
 import { loadPassword, parseSettings, root, settings } from './config';
 import { adbEnvironment, inspectAdbIdentity, prepareAdbIdentity } from './adb-identity';
 import { encodeTouchControl, StreamService, StreamSession } from './stream';
+import { StorageService } from './storage';
 
 process.env.ADMIN_PASSWORD = randomBytes(24).toString('hex');
 const sessionDirectory = mkdtempSync(path.join(tmpdir(), 'adb-auth-test-'));
-settings.sessionFile = path.join(sessionDirectory, 'sessions.json');
-settings.deviceRecordsFile = path.join(sessionDirectory, 'devices.json');
+settings.dataDir = sessionDirectory;
+settings.databaseFile = path.join(sessionDirectory, 'adb-desk.sqlite');
+beforeEach(() => rmSync(settings.databaseFile, { force: true }));
 after(() => rmSync(sessionDirectory, { recursive: true, force: true }));
 
 test('ADB identity rejects orphaned public keys without replacing them and isolates environment', async () => {
@@ -157,8 +159,7 @@ test('development and production ports are independent and data paths follow DAT
     const configuration = parseSettings({ DATA_DIR: directory });
     const expected = path.resolve(root, directory || '.data');
     assert.equal(configuration.dataDir, expected);
-    assert.equal(configuration.sessionFile, path.join(expected, 'sessions.json'));
-    assert.equal(configuration.deviceRecordsFile, path.join(expected, 'devices.json'));
+    assert.equal(configuration.databaseFile, path.join(expected, 'adb-desk.sqlite'));
   }
 });
 
@@ -291,14 +292,14 @@ test('random sessions, revocation, expiry and login throttling', () => {
   auth.revoke(first.token);
   assert.equal(auth.find(first.token), undefined);
   assert.equal(auth.find(second.token)?.id, second.session.id);
-  second.session.expiresAt = 0;
+  new StorageService().transaction((database) => database.exec('UPDATE sessions SET expiresAt = 0'));
   assert.equal(auth.find(second.token), undefined);
   for (let attempt = 0; attempt < 5; attempt += 1) assert.throws(() => auth.login('wrong', 'limited'));
   assert.throws(() => auth.login(process.env.ADMIN_PASSWORD!, 'limited'));
 });
 
 test('optional two-factor enrollment, replay prevention, recovery and trusted browser expiry', (context) => {
-  const filename = path.join(sessionDirectory, 'two-factor.json');
+  const filename = settings.databaseFile;
   context.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
   try {
     const factor = new TwoFactorService();
@@ -321,7 +322,7 @@ test('optional two-factor enrollment, replay prevention, recovery and trusted br
     assert.equal(new TwoFactorService().verify(totp.generate()), false);
     const trusted = factor.remember(7);
     assert.equal(new TwoFactorService().isTrusted(trusted.token), true);
-    const contents = readFileSync(filename, 'utf8');
+    const contents = JSON.stringify(new StorageService().factor());
     assert.ok(!contents.includes(trusted.token));
     assert.ok(!contents.includes(recoveryCodes[1]));
     assert.ok(!contents.includes(process.env.ADMIN_PASSWORD!));
@@ -332,10 +333,15 @@ test('optional two-factor enrollment, replay prevention, recovery and trusted br
     const another = factor.remember(1);
     factor.revokeTrusted();
     assert.equal(new TwoFactorService().isTrusted(another.token), false);
-    mkdirSync(`${filename}.tmp`);
+    const store = new StorageService();
+    store.transaction((database) =>
+      database.exec(
+        "CREATE TRIGGER fail_factor BEFORE UPDATE ON two_factor BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+      ),
+    );
     assert.throws(() => factor.disable());
     assert.equal(factor.enabled, true);
-    rmSync(`${filename}.tmp`, { recursive: true });
+    store.transaction((database) => database.exec('DROP TRIGGER fail_factor'));
     factor.disable();
     assert.equal(new TwoFactorService().enabled, false);
     const expired = factor.begin('owner');
@@ -347,7 +353,7 @@ test('optional two-factor enrollment, replay prevention, recovery and trusted br
 });
 
 test('two-factor login challenges cannot replace sessions until verification succeeds', (context) => {
-  const filename = path.join(sessionDirectory, 'two-factor.json');
+  const filename = settings.databaseFile;
   context.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
   try {
     const factor = new TwoFactorService();
@@ -392,7 +398,7 @@ test('two-factor login challenges cannot replace sessions until verification suc
 });
 
 test('two-factor HTTP enrollment, trusted cookies, validation, expiry and revocation', async (context) => {
-  const filename = path.join(sessionDirectory, 'two-factor.json');
+  const filename = settings.databaseFile;
   const previousSecure = settings.secureCookie;
   context.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
   settings.secureCookie = true;
@@ -542,7 +548,6 @@ test('device records persist, deduplicate and retain deletion during polling', (
   records.observe([]);
   assert.equal(records.list().length, 2);
   assert.deepEqual(new DeviceRecordsService().list(), records.list());
-  assert.deepEqual(JSON.parse(readFileSync(settings.deviceRecordsFile, 'utf8')), records.list());
   records.updateNote(device.serial, ' 客厅手机 ');
   assert.equal(records.list().find((record) => record.serial === device.serial)?.note, '客厅手机');
   records.observe([device]);
@@ -570,22 +575,7 @@ test('device records persist, deduplicate and retain deletion during polling', (
   assert.throws(() => records.remove('../sessions.json'));
   records.remove(device.serial);
   records.remove(usb.serial);
-  writeFileSync(
-    settings.deviceRecordsFile,
-    JSON.stringify([
-      { serial: device.serial, model: device.model, transport: device.transport, lastConnectedAt: 4000 },
-    ]),
-  );
-  assert.deepEqual(new DeviceRecordsService().list(), [
-    {
-      serial: device.serial,
-      model: device.model,
-      transport: device.transport,
-      lastConnectedAt: 4000,
-      note: '',
-    },
-  ]);
-  rmSync(settings.deviceRecordsFile, { force: true });
+  assert.deepEqual(new DeviceRecordsService().list(), []);
 });
 
 test('sessions last at least 24 hours and survive restarts without persisting credentials', (context) => {
@@ -595,7 +585,9 @@ test('sessions last at least 24 hours and survive restarts without persisting cr
   const { token, session } = auth.login(process.env.ADMIN_PASSWORD!, 'persistent');
   assert.ok(settings.sessionHours >= 24);
   assert.equal(session.expiresAt, now + settings.sessionHours * 3_600_000);
-  const stored = readFileSync(settings.sessionFile, 'utf8');
+  const stored = JSON.stringify(
+    new StorageService().read((database) => database.prepare('SELECT * FROM sessions').all()),
+  );
   assert.ok(!stored.includes(token));
   assert.ok(!stored.includes(process.env.ADMIN_PASSWORD!));
   context.mock.timers.setTime(now + 23 * 3_600_000);
@@ -619,21 +611,6 @@ test('sessions last at least 24 hours and survive restarts without persisting cr
   } finally {
     process.env.ADMIN_PASSWORD = password;
   }
-});
-
-test('upgrading a multi-session store keeps only the latest login across restarts', () => {
-  const auth = new AuthService();
-  const first = auth.login(process.env.ADMIN_PASSWORD!, 'legacy-first');
-  const firstEntries = JSON.parse(readFileSync(settings.sessionFile, 'utf8'));
-  const second = auth.login(process.env.ADMIN_PASSWORD!, 'legacy-last');
-  const secondEntries = JSON.parse(readFileSync(settings.sessionFile, 'utf8'));
-  writeFileSync(settings.sessionFile, JSON.stringify([...firstEntries, ...secondEntries]));
-  const restored = new AuthService();
-  assert.equal(restored.find(first.token), undefined);
-  assert.deepEqual(restored.find(second.token), second.session);
-  assert.equal(JSON.parse(readFileSync(settings.sessionFile, 'utf8')).length, 1);
-  assert.equal(new AuthService().find(first.token), undefined);
-  assert.deepEqual(new AuthService().find(second.token), second.session);
 });
 
 test('stream ownership, concurrent replacement, exit cleanup and shutdown', async () => {
@@ -924,7 +901,7 @@ for (const twoFactor of [false, true]) {
     } finally {
       viewer?.terminate();
       await app.close();
-      if (twoFactor) rmSync(path.join(sessionDirectory, 'two-factor.json'), { force: true });
+      if (twoFactor) rmSync(settings.databaseFile, { force: true });
     }
   });
 }

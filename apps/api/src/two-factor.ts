@@ -1,53 +1,22 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { createHmac, randomBytes, scryptSync } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import { TOTP, Secret } from 'otpauth';
-import { loadPassword, settings } from './config';
+import { loadPassword } from './config';
+import { FactorState, StorageService } from './storage';
 
 export const TRUST_COOKIE = 'adb_trusted_browser';
 export const MAX_TRUST_DAYS = 90;
 const DAY = 86_400_000;
-interface FactorState {
-  version: string;
-  secret: string;
-  lastStep: number;
-  recovery: string[];
-  trusted: { hash: string; expiresAt: number }[];
-}
 
 @Injectable()
 export class TwoFactorService {
-  private readonly filename = path.join(path.dirname(settings.sessionFile), 'two-factor.json');
   private readonly key = scryptSync(loadPassword(), 'adb-two-factor-v1', 32);
-  private state: FactorState = {
-    version: randomBytes(16).toString('hex'),
-    secret: '',
-    lastStep: -1,
-    recovery: [],
-    trusted: [],
-  };
   private pending?: { secret: string; sessionId: string; expiresAt: number };
 
-  constructor() {
-    if (!existsSync(this.filename)) return;
-    const state: FactorState = JSON.parse(readFileSync(this.filename, 'utf8'));
-    const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-    if (
-      !state ||
-      !/^[a-f0-9]{32}$/.test(state.version) ||
-      typeof state.secret !== 'string' ||
-      (state.secret !== '' && !/^[A-Z2-7]{32}$/.test(state.secret)) ||
-      !Number.isSafeInteger(state.lastStep) ||
-      state.lastStep < -1 ||
-      !Array.isArray(state.recovery) ||
-      !state.recovery.every(digest) ||
-      !Array.isArray(state.trusted) ||
-      !state.trusted.every((entry) => entry && digest(entry.hash) && Number.isSafeInteger(entry.expiresAt))
-    ) {
-      throw new Error('Invalid two-factor store; restore a protected backup before restarting');
-    }
-    this.state = state;
+  constructor(readonly store: StorageService = new StorageService()) {}
+
+  private get state() {
+    return this.store.factor();
   }
 
   get enabled() {
@@ -77,41 +46,47 @@ export class TwoFactorService {
   }
 
   enable(sessionId: string, code: string) {
-    if (
-      this.enabled ||
-      !this.pending ||
-      this.pending.sessionId !== sessionId ||
-      this.pending.expiresAt <= Date.now()
-    )
-      throw new BadRequestException('绑定已失效，请重新开始');
-    const step = this.step(this.pending.secret, code, -1);
-    if (step === null) throw new BadRequestException('验证码不正确或已过期');
-    const recoveryCodes = Array.from({ length: 10 }, () => randomBytes(10).toString('hex'));
-    this.persist({
-      version: randomBytes(16).toString('hex'),
-      secret: this.pending.secret,
-      lastStep: step,
-      recovery: recoveryCodes.map((code) => this.hash(code)),
-      trusted: [],
+    const result = this.store.transaction(() => {
+      if (
+        this.enabled ||
+        !this.pending ||
+        this.pending.sessionId !== sessionId ||
+        this.pending.expiresAt <= Date.now()
+      )
+        throw new BadRequestException('绑定已失效，请重新开始');
+      const step = this.step(this.pending.secret, code, -1);
+      if (step === null) throw new BadRequestException('验证码不正确或已过期');
+      const recoveryCodes = Array.from({ length: 10 }, () => randomBytes(10).toString('hex'));
+      this.persist({
+        version: randomBytes(16).toString('hex'),
+        secret: this.pending.secret,
+        lastStep: step,
+        recovery: recoveryCodes.map((code) => this.hash(code)),
+        trusted: [],
+      });
+      return { recoveryCodes };
     });
     this.pending = undefined;
-    return { recoveryCodes };
+    return result;
   }
 
   verify(code: string) {
-    if (!this.enabled) return false;
-    const step = this.step(this.state.secret, code, this.state.lastStep);
-    if (step !== null) {
-      this.persist({ ...this.state, lastStep: step });
-    } else {
-      const index = this.state.recovery.indexOf(this.hash(code));
-      if (!/^[a-f0-9]{20}$/.test(code) || index === -1) return false;
-      this.persist({
-        ...this.state,
-        recovery: this.state.recovery.filter((_, position) => position !== index),
-      });
-    }
-    return true;
+    return this.store.transaction(() => {
+      const state = this.state;
+      if (!state.secret) return false;
+      const step = this.step(state.secret, code, state.lastStep);
+      if (step !== null) {
+        this.persist({ ...state, lastStep: step });
+      } else {
+        const index = state.recovery.indexOf(this.hash(code));
+        if (!/^[a-f0-9]{20}$/.test(code) || index === -1) return false;
+        this.persist({
+          ...state,
+          recovery: state.recovery.filter((_, position) => position !== index),
+        });
+      }
+      return true;
+    });
   }
 
   isTrusted(token?: string) {
@@ -123,18 +98,22 @@ export class TwoFactorService {
   }
 
   remember(days: number) {
-    if (!this.enabled || !Number.isInteger(days) || days < 1 || days > MAX_TRUST_DAYS)
-      throw new BadRequestException('记忆天数必须为 1-90 天');
-    const token = randomBytes(32).toString('base64url');
-    const expiresAt = Date.now() + days * DAY;
-    const trusted = this.state.trusted.filter((entry) => entry.expiresAt > Date.now()).slice(-99);
-    trusted.push({ hash: this.hash(token), expiresAt });
-    this.persist({ ...this.state, trusted });
-    return { token, expiresAt };
+    return this.store.transaction(() => {
+      if (!this.enabled || !Number.isInteger(days) || days < 1 || days > MAX_TRUST_DAYS)
+        throw new BadRequestException('记忆天数必须为 1-90 天');
+      const token = randomBytes(32).toString('base64url');
+      const expiresAt = Date.now() + days * DAY;
+      const trusted = this.state.trusted.filter((entry) => entry.expiresAt > Date.now()).slice(-99);
+      trusted.push({ hash: this.hash(token), expiresAt });
+      this.persist({ ...this.state, trusted });
+      return { token, expiresAt };
+    });
   }
 
   revokeTrusted() {
-    this.persist({ ...this.state, trusted: [], version: randomBytes(16).toString('hex') });
+    this.store.transaction(() => {
+      this.persist({ ...this.state, trusted: [], version: randomBytes(16).toString('hex') });
+    });
   }
 
   disable() {
@@ -169,9 +148,6 @@ export class TwoFactorService {
     return createHmac('sha256', this.key).update(value).digest('hex');
   }
   private persist(next: FactorState) {
-    mkdirSync(path.dirname(this.filename), { recursive: true, mode: 0o700 });
-    writeFileSync(`${this.filename}.tmp`, JSON.stringify(next), { mode: 0o600 });
-    renameSync(`${this.filename}.tmp`, this.filename);
-    this.state = next;
+    this.store.saveFactor(next);
   }
 }

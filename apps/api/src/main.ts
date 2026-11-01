@@ -83,8 +83,11 @@ class AppController {
   @UseGuards(AuthGuard)
   async logout(@Req() request: AuthRequest, @Res({ passthrough: true }) reply: FastifyReply) {
     const token = request.cookies[COOKIE];
-    this.auth.revoke(token);
-    await this.streams.stopForAuth(request.session.id);
+    try {
+      this.auth.revoke(token);
+    } finally {
+      await this.streams.stopForAuth(request.session.id);
+    }
     reply.clearCookie(COOKIE, { path: '/' });
     return { ok: true };
   }

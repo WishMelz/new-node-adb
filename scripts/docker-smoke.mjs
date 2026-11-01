@@ -192,7 +192,8 @@ let phase = 'baseline';
     assert.match(header, /HttpOnly/i);
     assert.match(header, /SameSite=Strict/i);
     fs.writeFileSync(cookieFile, header.split(';')[0], {mode:0o600});
-    assert.ok(fs.existsSync(path.join(settings.dataDir, 'sessions.json')));
+    assert.ok(fs.existsSync(settings.databaseFile));
+    assert.equal(fs.statSync(settings.databaseFile).mode & 0o777, 0o600);
     phase = 'http-adb-lifecycle';
     assert.equal((await fetch(base + '/api/devices', {headers:{cookie:header.split(';')[0]}})).status, 200);
   } else {
@@ -204,7 +205,20 @@ let phase = 'baseline';
     assert.equal((await fetch(base + '/api/auth/session', {headers:{cookie}})).status, 401);
     fs.unlinkSync(cookieFile);
   }
-  console.log('PASS: ' + mode + ', port=' + settings.port + ', data=' + settings.dataDir + ', assets/auth/ADB identity+signature+restart/sharp');
+  phase = 'sqlite';
+  const {DatabaseSync} = require('node:sqlite');
+  const database = new DatabaseSync(settings.databaseFile, {readOnly:true});
+  try {
+    assert.equal(database.prepare('PRAGMA quick_check').get().quick_check, 'ok');
+    assert.equal(database.prepare('PRAGMA user_version').get().user_version, 1);
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, mode === 'create' ? 1 : 0);
+  } finally {
+    database.close();
+  }
+  for (const legacy of ['sessions.json', 'devices.json', 'two-factor.json']) {
+    assert.ok(!fs.existsSync(path.join(settings.dataDir, legacy)));
+  }
+  console.log('PASS: ' + mode + ', port=' + settings.port + ', data=' + settings.dataDir + ', assets/auth/SQLite/ADB identity+signature+restart/sharp');
 })().catch(error => {console.error('SMOKE_PHASE=' + phase + ';ERROR=' + error.name);process.exitCode=1;});
 `
 

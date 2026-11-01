@@ -6,7 +6,7 @@
     "dev": "tsc-watch --onSuccess \"node dist/main.js\"",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
-    "test": "npm run build && node --test dist/core.spec.js"
+    "test": "npm run build && node --test dist/*.spec.js"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

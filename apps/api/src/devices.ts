@@ -13,118 +13,94 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import { IsIn, IsInt, IsString, Matches, Max, Min, ValidateBy } from 'class-validator';
 import type { FastifyReply } from 'fastify';
 import { AdbService, Device, serialPattern, validateSerial } from './adb';
 import { AuthGuard, AuthModule } from './auth';
-import { settings } from './config';
+import { StorageModule, StorageService, StoredDevice } from './storage';
 
-export interface DeviceRecord {
-  serial: string;
-  model: string;
-  transport: 'network' | 'usb';
-  lastConnectedAt: number;
-  note: string;
-}
+export type DeviceRecord = StoredDevice;
 
 @Injectable()
 export class DeviceRecordsService {
-  private readonly filename = settings.deviceRecordsFile;
-  private readonly records = new Map<string, DeviceRecord>();
   private online = new Set<string>();
 
-  constructor() {
-    if (!existsSync(this.filename)) return;
-    const records: unknown = JSON.parse(readFileSync(this.filename, 'utf8'));
-    if (!Array.isArray(records)) throw new Error('Invalid device records');
-    for (const record of records) {
-      if (
-        !record ||
-        typeof record.serial !== 'string' ||
-        !serialPattern.test(record.serial) ||
-        typeof record.model !== 'string' ||
-        !['network', 'usb'].includes(record.transport) ||
-        !Number.isSafeInteger(record.lastConnectedAt) ||
-        record.lastConnectedAt < 0 ||
-        (record.note !== undefined && typeof record.note !== 'string') ||
-        (typeof record.note === 'string' && [...record.note].length > 120)
-      )
-        throw new Error('Invalid device record');
-      this.records.set(record.serial, {
-        serial: record.serial,
-        model: record.model,
-        transport: record.transport,
-        lastConnectedAt: record.lastConnectedAt,
-        note: record.note ?? '',
-      });
-    }
-  }
+  constructor(private readonly store: StorageService = new StorageService()) {}
 
   list() {
-    return [...this.records.values()].sort(
-      (first, second) =>
-        second.lastConnectedAt - first.lastConnectedAt || first.serial.localeCompare(second.serial),
-    );
+    return this.store
+      .read((database) =>
+        database
+          .prepare('SELECT * FROM devices')
+          .all()
+          .map((record) => ({ ...record }) as unknown as DeviceRecord),
+      )
+      .sort(
+        (first, second) =>
+          second.lastConnectedAt - first.lastConnectedAt || first.serial.localeCompare(second.serial),
+      );
   }
 
   remember(host: string) {
     validateSerial(host);
-    const previous = this.records.get(host);
-    this.records.set(host, {
-      serial: host,
-      model: previous?.model || host,
-      transport: 'network',
-      lastConnectedAt: Date.now(),
-      note: previous?.note ?? '',
+    this.store.transaction((database) => {
+      database
+        .prepare(
+          `
+        INSERT INTO devices (serial, model, transport, lastConnectedAt, note) VALUES (?, ?, 'network', ?, '')
+        ON CONFLICT(serial) DO UPDATE SET transport = 'network', lastConnectedAt = excluded.lastConnectedAt
+      `,
+        )
+        .run(host, host, Date.now());
     });
     this.online.add(host);
-    this.persist();
   }
 
   observe(devices: Device[]) {
     const online = devices.filter((device) => device.state === 'device' && serialPattern.test(device.serial));
-    let changed = false;
-    for (const device of online) {
-      const previous = this.records.get(device.serial);
-      if (
-        !this.online.has(device.serial) ||
-        (previous && (previous.model !== device.model || previous.transport !== device.transport))
-      ) {
-        this.records.set(device.serial, {
-          serial: device.serial,
-          model: device.model,
-          transport: device.transport,
-          lastConnectedAt: this.online.has(device.serial) && previous ? previous.lastConnectedAt : Date.now(),
-          note: previous?.note ?? '',
-        });
-        changed = true;
+    this.store.transaction((database) => {
+      for (const device of online) {
+        const previous = database.prepare('SELECT * FROM devices WHERE serial = ?').get(device.serial);
+        if (
+          !this.online.has(device.serial) ||
+          (previous && (previous.model !== device.model || previous.transport !== device.transport))
+        ) {
+          database
+            .prepare(
+              `
+          INSERT INTO devices (serial, model, transport, lastConnectedAt, note) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(serial) DO UPDATE SET model = excluded.model, transport = excluded.transport,
+            lastConnectedAt = excluded.lastConnectedAt
+        `,
+            )
+            .run(
+              device.serial,
+              device.model,
+              device.transport,
+              this.online.has(device.serial) && previous ? previous.lastConnectedAt : Date.now(),
+              previous?.note ?? '',
+            );
+        }
       }
-    }
+    });
     this.online = new Set(online.map((device) => device.serial));
-    if (changed) this.persist();
   }
 
   remove(serial: string) {
     validateSerial(serial);
-    if (this.records.delete(serial)) this.persist();
+    this.store.transaction((database) =>
+      database.prepare('DELETE FROM devices WHERE serial = ?').run(serial),
+    );
   }
 
   updateNote(serial: string, note: string) {
     validateSerial(serial);
-    const record = this.records.get(serial);
-    if (!record) return undefined;
-    record.note = note.trim();
-    this.persist();
-    return record;
-  }
-
-  private persist() {
-    mkdirSync(path.dirname(this.filename), { recursive: true, mode: 0o700 });
-    const temporary = `${this.filename}.tmp`;
-    writeFileSync(temporary, JSON.stringify(this.list(), null, 2), { mode: 0o600 });
-    renameSync(temporary, this.filename);
+    return this.store.transaction((database) => {
+      const record = database
+        .prepare('UPDATE devices SET note = ? WHERE serial = ? RETURNING *')
+        .get(note.trim(), serial);
+      return record ? ({ ...record } as unknown as DeviceRecord) : undefined;
+    });
   }
 }
 
@@ -271,7 +247,7 @@ class DevicesController {
 }
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, StorageModule],
   providers: [AdbService, DeviceRecordsService],
   controllers: [DevicesController],
   exports: [AdbService],

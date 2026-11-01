@@ -2,6 +2,8 @@ node_modules/
 dist/
 .env
 .data/
+*.sqlite
+*.sqlite-*
 *.log
 coverage/
 .DS_Store

@@ -21,8 +21,7 @@ export function parseSettings(environment: NodeJS.ProcessEnv) {
   return {
     port: integer(production ? 'DOCKER_PORT' : 'DEV_API_PORT', production ? 23120 : 23110, 1, 65535),
     dataDir,
-    sessionFile: path.join(dataDir, 'sessions.json'),
-    deviceRecordsFile: path.join(dataDir, 'devices.json'),
+    databaseFile: path.join(dataDir, 'adb-desk.sqlite'),
     secureCookie: secureCookie === 'true',
     sessionHours: integer('SESSION_HOURS', 24, 24, 8760),
     loginMaxAttempts: integer('LOGIN_MAX_ATTEMPTS', 5, 1, 100),
