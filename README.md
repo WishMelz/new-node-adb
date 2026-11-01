@@ -112,7 +112,7 @@ COOKIE_SECURE=true
 
 Compose 项目和服务名称均为 `adb-desk`，默认使用 Docker Hub 镜像 `wishmelz/adb-desk:latest`，支持 `linux/amd64` 和 `linux/arm64`，Docker 自动选择对应架构；默认容器名为 `adb-desk-adb-desk-1`（可由 `-p` 或 `COMPOSE_PROJECT_NAME` 覆盖项目名）。
 
-部署配置需要 `compose.yaml` 和 `.env`，使用 Docker Compose 2.24.0 或更新版本。此次环境变量改动尚未发布到 Docker Hub，当前源码应先在源码目录执行 `npm ci`、`npm run build` 和 `docker build -t adb-desk:local .`，再将 Compose 的 `image` 改为 `adb-desk:local`；不要直接用旧 `latest` 验证新配置。发布匹配版本后可直接拉取镜像，无需安装 Node.js 或本地构建。保留 `DATA_DIR` 内的数据，不要将其打入镜像或公开分享。
+部署配置需要 `compose.yaml` 和 `.env`，使用 Docker Compose 2.24.0 或更新版本。`1.0.1` 已发布到 Docker Hub，`latest` 同步指向该版本，包含下述环境变量配置和 ADB 密钥持久化，可直接拉取镜像，无需安装 Node.js 或本地构建。如需固定版本，将 Compose 的 `image` 改为 `wishmelz/adb-desk:1.0.1`。自行构建时，在源码目录执行 `npm ci`、`npm run build` 和 `docker build -t adb-desk:local .`，再将 `image` 改为 `adb-desk:local`。保留 `DATA_DIR` 内的数据，不要将其打入镜像或公开分享。
 
 当前 Dockerfile 使用 Node.js `22.23.4-slim`，只启动后端应用进程，不安装 Nginx，也不运行 Vite。密码和端口统一填写在 Compose 同目录的 `.env` 配置文件中，可参考 `.env.example`：
 

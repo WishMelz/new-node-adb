@@ -1,6 +1,6 @@
 {
   "name": "@adb/api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "scripts": {
     "dev": "tsc-watch --onSuccess \"node dist/main.js\"",
