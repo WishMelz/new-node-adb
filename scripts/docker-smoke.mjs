@@ -178,25 +178,40 @@ let phase = 'baseline';
     assert.equal((await fetch(base + missing)).status, 404);
   }
   assert.equal((await fetch(base + '/api/devices')).status, 401);
-  const password = fs.readFileSync(path.join(settings.dataDir, 'bootstrap-password'), 'utf8').trim();
-  assert.ok(password);
-  assert.equal(fs.statSync(path.join(settings.dataDir, 'bootstrap-password')).mode & 0o777, 0o600);
+  const password = 'smoke-test-admin-password';
   const cookieFile = path.join(settings.dataDir, 'smoke-session');
   if (mode === 'create') {
-    const login = await fetch(base + '/api/auth/login', {
+    const config = await fetch(base + '/api/auth/config');
+    assert.equal(config.status, 200);
+    assert.equal((await config.json()).mode, 'register');
+    const registration = await fetch(base + '/api/auth/register', {
       method:'POST', headers:{'content-type':'application/json',origin:'https://independent.example'},
-      body:JSON.stringify({password})
+      body:JSON.stringify({password,confirmPassword:password})
     });
-    assert.equal(login.status, 201);
-    const header = login.headers.get('set-cookie');
+    assert.equal(registration.status, 201);
+    const header = registration.headers.get('set-cookie');
     assert.match(header, /HttpOnly/i);
     assert.match(header, /SameSite=Strict/i);
     fs.writeFileSync(cookieFile, header.split(';')[0], {mode:0o600});
     assert.ok(fs.existsSync(settings.databaseFile));
     assert.equal(fs.statSync(settings.databaseFile).mode & 0o777, 0o600);
+    assert.equal(
+      (
+        await fetch(base + '/api/auth/register', {
+          method:'POST', headers:{'content-type':'application/json',origin:'https://independent.example'},
+          body:JSON.stringify({password,confirmPassword:password})
+        })
+      ).status,
+      409
+    );
+    assert.equal((await (await fetch(base + '/api/auth/config')).json()).mode, 'password');
+    assert.ok(!fs.existsSync(path.join(settings.dataDir, 'bootstrap-password')));
     phase = 'http-adb-lifecycle';
     assert.equal((await fetch(base + '/api/devices', {headers:{cookie:header.split(';')[0]}})).status, 200);
   } else {
+    const config = await fetch(base + '/api/auth/config');
+    assert.equal(config.status, 200);
+    assert.equal((await config.json()).mode, 'password');
     const cookie = fs.readFileSync(cookieFile, 'utf8');
     assert.equal((await fetch(base + '/api/auth/session', {headers:{cookie}})).status, 200);
     phase = 'http-adb-lifecycle';
@@ -210,7 +225,8 @@ let phase = 'baseline';
   const database = new DatabaseSync(settings.databaseFile, {readOnly:true});
   try {
     assert.equal(database.prepare('PRAGMA quick_check').get().quick_check, 'ok');
-    assert.equal(database.prepare('PRAGMA user_version').get().user_version, 1);
+    assert.equal(database.prepare('PRAGMA user_version').get().user_version, 2);
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM admin_account').get().count, 1);
     assert.equal(database.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, mode === 'create' ? 1 : 0);
   } finally {
     database.close();

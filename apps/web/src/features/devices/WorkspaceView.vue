@@ -37,6 +37,16 @@ const streamState = useStream(
 const { stage } = streamState
 const stream = reactive(streamState)
 const records = reactive(useDeviceRecords(deviceState.devices, activity.log, activity.showError))
+const selectedNote = computed(() =>
+  records.records.find((record) => record.serial === devices.selectedSerial)?.note.trim(),
+)
+const deviceOptions = computed(() => {
+  const notes = new Map(records.records.map((record) => [record.serial, record.note.trim()]))
+  return devices.options.map((option) => ({
+    ...option,
+    label: notes.get(option.value) ? `${notes.get(option.value)} · ${option.value}` : option.label,
+  }))
+})
 const layoutState = useWorkspace(stream.cancel, stream.pageLeaving)
 const { workspace } = layoutState
 const layout = reactive(layoutState)
@@ -45,7 +55,8 @@ let refreshTimer: ReturnType<typeof setInterval> | undefined
 
 const connectionLabel = computed(() => {
   if (devices.switching || devices.loading) return '检查设备'
-  if (stream.active) return stream.canTouch ? '可操作' : stream.state === '实时视频' ? '等待控制' : '连接中'
+  if (stream.running)
+    return stream.canTouch ? stream.modeLabel : stream.state === '实时视频' ? '等待控制' : '连接中'
   if (devices.ready) return '设备已连接'
   return devices.selected ? `设备状态：${devices.selected.state}` : '请连接设备'
 })
@@ -71,7 +82,7 @@ async function selectDevice(value: unknown) {
   const serial = typeof value === 'string' ? value : ''
   if (disposed || serial === devices.selectedSerial || devices.switching) return
   devices.switching = true
-  const resume = !!stream.active
+  const resume = stream.running
   try {
     await stream.stop()
     if (disposed) return
@@ -182,17 +193,19 @@ onBeforeUnmount(() => {
   <main ref="workspace" class="workspace" :class="{ expanded: layout.expanded }">
     <DeviceToolbar
       :selected-serial="devices.selectedSerial"
-      :device-options="devices.options"
+      :device-options="deviceOptions"
       :switching="devices.switching || devices.commandPending || devices.connecting"
       :loading-stream="stream.loading"
       :loading-device="devices.loading"
-      :active-stream="!!stream.active"
+      :active-stream="stream.running"
       :loading-screen="stream.loadingScreen"
       :fullscreen="layout.fullscreen"
       :expanded="layout.expanded"
       :is-ready="devices.ready"
       :can-touch="stream.canTouch"
       :connection-label="connectionLabel"
+      :playback-mode="stream.playbackMode"
+      @playback-mode="stream.changeMode"
       @select="selectDevice"
       @refresh="refreshDevices"
       @records="openRecords"
@@ -211,11 +224,17 @@ onBeforeUnmount(() => {
           :can-touch="stream.canTouch"
           :is-ready="devices.ready"
           :selected-model="devices.selected?.model"
+          :selected-note="selectedNote"
           :selected-serial="devices.selectedSerial"
           :loading-stream="stream.loading"
           :loading-device="devices.loading"
           :device-records-count="records.records.length"
           :stream-state="stream.state"
+          :playback-error="stream.playbackError"
+          :image-active="stream.imageActive"
+          :image-url="stream.imageUrl"
+          @image-loaded="stream.imageLoaded"
+          @image-error="stream.imageFailed()"
           @pointerdown="stream.down"
           @pointermove="stream.move"
           @pointerup="stream.up"
@@ -226,12 +245,13 @@ onBeforeUnmount(() => {
           @records="openRecords"
           @playing="stream.playing"
           @resize="stream.cancel"
+          @retry="stream.start"
         />
         <ScreenFooter
           :caption="devices.caption"
           :can-command="devices.canCommand"
           :can-touch="stream.canTouch"
-          :active-stream="!!stream.active"
+          :active-stream="stream.running"
           @action="actionKey"
         />
       </div>
@@ -240,8 +260,11 @@ onBeforeUnmount(() => {
         v-model:package-name="packageName"
         :selected-serial="devices.selectedSerial"
         :selected-model="devices.selected?.model"
+        :selected-note="selectedNote"
         :can-command="devices.canCommand"
+        :can-swipe-home="stream.canTouch && !stream.swipingHome && !interactionBlocked"
         :can-disconnect="devices.selected?.transport === 'network' && devices.canCommand"
+        @swipe-home="stream.swipeHome"
         @disconnect="disconnect"
         @action="actionKey"
         @send="sendText"

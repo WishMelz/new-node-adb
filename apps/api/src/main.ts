@@ -10,7 +10,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import { WebSocketServer } from 'ws';
-import { AuthModule, AuthService, COOKIE, LoginDto, VerifyLoginDto } from './auth';
+import { AuthModule, AuthService, COOKIE, LoginDto, RegisterDto, VerifyLoginDto } from './auth';
 import { TRUST_COOKIE } from './two-factor';
 import { DevicesModule } from './devices';
 import { root, settings } from './config';
@@ -46,6 +46,15 @@ class AppController {
   ) {
     const result = this.auth.beginLogin(body.password, request.ip, request.cookies[TRUST_COOKIE]);
     if ('requiresTwoFactor' in result) return result;
+    return this.finishLogin(result, reply);
+  }
+  @Post('auth/register')
+  async register(
+    @Body() body: RegisterDto,
+    @Req() request: FastifyRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
+    const result = this.auth.register(body.password, body.confirmPassword, request.ip);
     return this.finishLogin(result, reply);
   }
   @Post('auth/verify')

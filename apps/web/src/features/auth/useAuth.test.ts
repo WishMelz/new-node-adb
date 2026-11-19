@@ -13,6 +13,7 @@ vi.mock('../../api', () => ({
   authConfig: vi.fn(),
   session: vi.fn(),
   login: vi.fn(),
+  register: vi.fn(),
   verifyLogin: vi.fn(),
   logout: vi.fn(),
   securityStatus: vi.fn(),
@@ -46,6 +47,9 @@ it('shows ADB Desk branding on the header and login screen', async () => {
     expect(header.emitted('logout')).toHaveLength(1)
     await login.setProps({ twoFactor: true })
     expect(login.get('h1').text()).toBe('双重验证')
+    await login.setProps({ twoFactor: false, mode: 'register' })
+    expect(login.get('h1').text()).toBe('创建管理员账户')
+    expect(login.get('button[type="submit"]').text()).toContain('创建管理员账户')
   } finally {
     header.unmount()
     login.unmount()
@@ -92,6 +96,30 @@ describe('authentication lifecycle', () => {
     expect(auth.authenticated.value).toBe(false)
     expect(auth.error.value).toBe('')
     expect(MessagePlugin.error).not.toHaveBeenCalled()
+  })
+  it('registers the first administrator, accepts the session and switches modes', async () => {
+    vi.mocked(api.authConfig).mockResolvedValue({ mode: 'register', sessionHours: 24 })
+    vi.mocked(api.register).mockResolvedValue({ expiresAt: expiresAt() })
+    await create()
+    await auth.register('new-password', 'new-password')
+    expect(api.register).toHaveBeenCalledExactlyOnceWith('new-password', 'new-password')
+    expect(auth.authenticated.value).toBe(true)
+    expect(auth.mode.value).toBe('password')
+  })
+  it('reports mismatched registration passwords without sending a request', async () => {
+    vi.mocked(api.authConfig).mockResolvedValue({ mode: 'register', sessionHours: 24 })
+    await create()
+    await auth.register('new-password', 'different-password')
+    expect(api.register).not.toHaveBeenCalled()
+    expect(auth.error.value).toBe('两次输入的密码不一致')
+  })
+  it('returns to password mode when another registration wins the race', async () => {
+    vi.mocked(api.authConfig).mockResolvedValue({ mode: 'register', sessionHours: 24 })
+    vi.mocked(api.register).mockRejectedValue(httpError(409))
+    await create()
+    await auth.register('new-password', 'new-password')
+    expect(auth.mode.value).toBe('password')
+    expect(auth.error.value).toContain('管理员已注册')
   })
   it('restores a session and expires on an unauthorized response event', async () => {
     vi.mocked(api.session).mockResolvedValue({ expiresAt: expiresAt() })
@@ -360,7 +388,7 @@ describe('authentication errors', () => {
   it.each([
     [401, '访问密码不正确'],
     [429, '尝试次数过多'],
-    [403, '请求来源不被允许'],
+    [403, '请求被拒绝'],
     [500, '登录服务暂不可用'],
   ])('maps HTTP %s without exposing backend details', (status, expected) => {
     const error = Object.assign(new AxiosError(), {

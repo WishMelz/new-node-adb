@@ -20,7 +20,7 @@ import { existsSync } from 'node:fs';
 import net from 'node:net';
 import type { ChildProcess } from 'node:child_process';
 import type { RawData, WebSocket } from 'ws';
-import { IsInt, IsString, Matches, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsString, Matches, Max, Min } from 'class-validator';
 import { AdbService, serialPattern } from './adb';
 import { AuthGuard, AuthModule, AuthRequest, AuthService } from './auth';
 import { settings } from './config';
@@ -28,12 +28,14 @@ import { DevicesModule } from './devices';
 
 class StartStreamDto {
   @IsString() @Matches(serialPattern) serial!: string;
+  @IsIn(['h264', 'h265']) videoCodec: 'h264' | 'h265' = 'h264';
   @IsInt() @Min(480) @Max(1920) maxSize = settings.streamMaxSize;
   @IsInt() @Min(10) @Max(60) maxFps = settings.streamMaxFps;
   @IsInt() @Min(500_000) @Max(12_000_000) bitRate = settings.streamBitRate;
 }
 
-type StreamOptions = Pick<StartStreamDto, 'maxSize' | 'maxFps' | 'bitRate'>;
+type StreamOptions = Pick<StartStreamDto, 'maxSize' | 'maxFps' | 'bitRate'> &
+  Partial<Pick<StartStreamDto, 'videoCodec'>>;
 
 export type TouchAction = 'down' | 'move' | 'up' | 'cancel';
 export interface TouchControl {
@@ -175,7 +177,7 @@ export class StreamSession {
         `max_size=${this.options.maxSize}`,
         `max_fps=${this.options.maxFps}`,
         `video_bit_rate=${this.options.bitRate}`,
-        'video_codec=h264',
+        `video_codec=${this.options.videoCodec ?? 'h264'}`,
       ]);
       this.process.stdout?.resume();
       this.process.stderr?.resume();
@@ -426,6 +428,7 @@ export class StreamService implements OnModuleDestroy {
           maxSize: Math.min(options.maxSize, settings.streamMaxSize),
           maxFps: Math.min(options.maxFps, settings.streamMaxFps),
           bitRate: Math.min(options.bitRate, settings.streamBitRate),
+          videoCodec: options.videoCodec ?? 'h264',
         },
         () => this.sessions.delete(session.id),
       );
@@ -459,10 +462,18 @@ export class StreamService implements OnModuleDestroy {
     return true;
   }
   stopForAuth(authSessionId: string) {
-    return this.stopSessions(
-      [...this.sessions.values()].filter((session) => session.authSessionId === authSessionId),
-      'logout',
-    );
+    const sessions = [...this.sessions.values()].filter((session) => session.authSessionId === authSessionId);
+    const operation = Promise.all([
+      this.pending,
+      ...sessions.map((session) => this.stop(session.id, 'logout')),
+    ]).then(async () => {
+      const remaining = [...this.sessions.values()].filter(
+        (session) => session.authSessionId === authSessionId,
+      );
+      await Promise.all(remaining.map((session) => this.stop(session.id, 'logout')));
+    });
+    this.pending = operation.catch(() => {});
+    return operation;
   }
   stopInactive() {
     return this.stopSessions(

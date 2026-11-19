@@ -7,7 +7,7 @@ export function authErrorMessage(error: unknown) {
   if (!isAxiosError(error) || !error.response) return '无法连接服务，请稍后重试'
   if (error.response.status === 401) return '访问密码不正确'
   if (error.response.status === 429) return '尝试次数过多，请稍后重试'
-  if (error.response.status === 403) return '请求来源不被允许，请检查服务端配置'
+  if (error.response.status === 403) return '请求被拒绝，请稍后重试'
   return '登录服务暂不可用，请稍后重试'
 }
 
@@ -17,6 +17,7 @@ export function useAuth() {
   const pending = ref(false)
   const error = ref('')
   const sessionHours = ref(24)
+  const mode = ref<api.AuthMode>('password')
   const challenge = ref<api.TwoFactorChallenge | null>(null)
   let version = 0
   let expiryTimer: ReturnType<typeof setTimeout> | undefined
@@ -55,6 +56,7 @@ export function useAuth() {
       const config = await api.authConfig()
       if (current !== version) return
       sessionHours.value = config.sessionHours
+      mode.value = config.mode
       const session = await api.session()
       if (current === version) accept(session.expiresAt)
     } catch (failure) {
@@ -84,6 +86,35 @@ export function useAuth() {
       } else accept(result.expiresAt)
     } catch (failure) {
       if (current === version) error.value = authErrorMessage(failure)
+    } finally {
+      pending.value = false
+    }
+  }
+
+  async function register(password: string, confirmPassword: string) {
+    if (!password || pending.value) return
+    if (password !== confirmPassword) {
+      error.value = '两次输入的密码不一致'
+      return
+    }
+    const current = ++version
+    pending.value = true
+    error.value = ''
+    try {
+      const result = await api.register(password, confirmPassword)
+      if (current === version) {
+        mode.value = 'password'
+        accept(result.expiresAt)
+      }
+    } catch (failure) {
+      if (current === version) {
+        if (isAxiosError(failure) && failure.response?.status === 409) {
+          error.value = '管理员已注册，请重新检查服务'
+          mode.value = 'password'
+        } else if (isAxiosError(failure) && failure.response?.status === 400) {
+          error.value = '两次输入的密码不一致'
+        } else error.value = authErrorMessage(failure)
+      }
     } finally {
       pending.value = false
     }
@@ -155,8 +186,10 @@ export function useAuth() {
     pending,
     error,
     sessionHours,
+    mode,
     challenge,
     login,
+    register,
     verify,
     cancelVerification,
     logout,

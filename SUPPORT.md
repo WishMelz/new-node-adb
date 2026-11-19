@@ -12,7 +12,7 @@
 - 是否使用 Docker、反向代理或 HTTPS
 - `npm run lint`、`npm test` 或 `npm run build` 的完整错误摘要
 
-不要提交 `.env`、`.data`、bootstrap-password、Cookie、sessions.json 或包含设备凭据的日志。
+不要提交 `.env`、`.data`、旧版 `bootstrap-password`、Cookie、sessions.json 或包含设备凭据的日志。新部署的管理员密码保存在 SQLite 哈希中，也不要上传数据库或备份。
 
 ## Issue 范围
 

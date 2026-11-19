@@ -13,8 +13,10 @@ const {
   pending,
   error,
   sessionHours,
+  mode,
   challenge,
   login,
+  register,
   verify,
   cancelVerification,
   logout,
@@ -34,9 +36,11 @@ watch(authenticated, () => {
       :pending="pending"
       :error="error"
       :session-hours="sessionHours"
+      :mode="mode"
       :two-factor="!!challenge"
       :max-trust-days="challenge?.maxTrustDays"
       @login="login"
+      @register="register"
       @verify="verify"
       @cancel="cancelVerification"
       @retry="restore"

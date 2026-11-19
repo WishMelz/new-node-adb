@@ -21,6 +21,12 @@ export interface FactorState {
   trusted: { hash: string; expiresAt: number }[];
 }
 
+export interface AdminAccount {
+  passwordSalt: string;
+  passwordHash: string;
+  createdAt: number;
+}
+
 export function emptyFactor(): FactorState {
   return { version: randomBytes(16).toString('hex'), secret: '', lastStep: -1, recovery: [], trusted: [] };
 }
@@ -60,8 +66,20 @@ export class StorageService {
     if (process.platform !== 'win32') chmodSync(this.filename, 0o600);
     this.transaction((database) => {
       const version = Number(database.prepare('PRAGMA user_version').get()!.user_version);
-      if (version > 1) throw new Error('Unsupported database version; upgrade the application');
-      if (version === 1) return;
+      if (version > 2) throw new Error('Unsupported database version; upgrade the application');
+      if (version === 1) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS admin_account (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            passwordSalt TEXT NOT NULL,
+            passwordHash TEXT NOT NULL,
+            createdAt INTEGER NOT NULL
+          );
+        `);
+        database.exec('PRAGMA user_version = 2');
+        return;
+      }
+      if (version === 2) return;
       database.exec(`
         CREATE TABLE sessions (
           tokenHash TEXT PRIMARY KEY,
@@ -79,9 +97,15 @@ export class StorageService {
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
           state TEXT NOT NULL CHECK (json_valid(state))
         );
+        CREATE TABLE admin_account (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          passwordSalt TEXT NOT NULL,
+          passwordHash TEXT NOT NULL,
+          createdAt INTEGER NOT NULL
+        );
       `);
       this.migrate(database);
-      database.exec('PRAGMA user_version = 1');
+      database.exec('PRAGMA user_version = 2');
     });
   }
 
@@ -121,6 +145,21 @@ export class StorageService {
       const row = database.prepare('SELECT state FROM two_factor WHERE singleton = 1').get();
       if (!row) throw new Error('Missing two-factor state; restore a protected database backup');
       return validateFactor(JSON.parse(String(row.state)));
+    });
+  }
+
+  adminAccount(): AdminAccount | undefined {
+    return this.read((database) => {
+      const row = database
+        .prepare('SELECT passwordSalt, passwordHash, createdAt FROM admin_account WHERE singleton = 1')
+        .get();
+      return row
+        ? {
+            passwordSalt: String(row.passwordSalt),
+            passwordHash: String(row.passwordHash),
+            createdAt: Number(row.createdAt),
+          }
+        : undefined;
     });
   }
 

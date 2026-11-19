@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   EnterIcon,
+  ArrowUpIcon,
   LockOnIcon,
   LogoutIcon,
   MinusIcon,
@@ -13,11 +14,14 @@ const packageName = defineModel<string>('packageName', { required: true })
 const props = defineProps<{
   selectedSerial: string
   selectedModel?: string
+  selectedNote?: string
   canCommand: boolean
+  canSwipeHome?: boolean
   canDisconnect: boolean
 }>()
 const emit = defineEmits<{
   disconnect: []
+  swipeHome: []
   action: [key: string, label: string]
   send: []
   launch: []
@@ -43,7 +47,8 @@ function launch() {
     <header class="device-controls-header">
       <div>
         <h2>当前设备</h2>
-        <strong>{{ selectedModel || selectedSerial || '未选择设备' }}</strong>
+        <strong>{{ selectedNote || selectedModel || selectedSerial || '未选择设备' }}</strong>
+        <p v-if="selectedNote && selectedModel">{{ selectedModel }}</p>
         <p v-if="selectedSerial" class="mono">{{ selectedSerial }}</p>
       </div>
       <t-tooltip content="断开设备"
@@ -60,6 +65,15 @@ function launch() {
     <section class="device-control-section" aria-label="设备按键">
       <h2>设备操作</h2>
       <div class="device-key-row">
+        <t-tooltip content="上划进入桌面（需开始控制）"
+          ><t-button
+            shape="square"
+            variant="outline"
+            aria-label="上划进入桌面"
+            :disabled="!canCommand || !canSwipeHome"
+            @click="canCommand && canSwipeHome && emit('swipeHome')"
+            ><template #icon><ArrowUpIcon /></template></t-button
+        ></t-tooltip>
         <t-tooltip v-for="item in keys" :key="item.key" :content="item.label"
           ><t-button
             shape="square"

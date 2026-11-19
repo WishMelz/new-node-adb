@@ -10,7 +10,6 @@ const DAY = 86_400_000;
 
 @Injectable()
 export class TwoFactorService {
-  private readonly key = scryptSync(loadPassword(), 'adb-two-factor-v1', 32);
   private pending?: { secret: string; sessionId: string; expiresAt: number };
 
   constructor(readonly store: StorageService = new StorageService()) {}
@@ -145,7 +144,14 @@ export class TwoFactorService {
     return delta !== null && step > lastStep ? step : null;
   }
   private hash(value: string) {
-    return createHmac('sha256', this.key).update(value).digest('hex');
+    const password = loadPassword();
+    const account = this.store.adminAccount();
+    const key = password
+      ? scryptSync(password, 'adb-two-factor-v1', 32)
+      : account
+        ? scryptSync(account.passwordHash, 'adb-two-factor-v1', 32)
+        : randomBytes(32);
+    return createHmac('sha256', key).update(value).digest('hex');
   }
   private persist(next: FactorState) {
     this.store.saveFactor(next);

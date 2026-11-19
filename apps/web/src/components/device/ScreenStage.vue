@@ -7,11 +7,15 @@ defineProps<{
   canTouch: boolean
   isReady: boolean
   selectedModel?: string
+  selectedNote?: string
   selectedSerial: string
   loadingStream: boolean
   loadingDevice: boolean
   deviceRecordsCount: number
   streamState: string
+  playbackError: string
+  imageActive?: boolean
+  imageUrl?: string
 }>()
 const emit = defineEmits<{
   pointerdown: [event: PointerEvent]
@@ -24,10 +28,14 @@ const emit = defineEmits<{
   records: []
   playing: []
   resize: []
+  retry: []
+  imageLoaded: []
+  imageError: []
 }>()
 const preview = ref<HTMLElement | null>(null)
 const video = ref<HTMLVideoElement | null>(null)
-defineExpose({ preview, video })
+const image = ref<HTMLImageElement | null>(null)
+defineExpose({ preview, video, image })
 </script>
 
 <template>
@@ -50,11 +58,32 @@ defineExpose({ preview, video })
       muted
       playsinline
       disablepictureinpicture
+      disableremoteplayback
       @playing="emit('playing')"
       @resize="emit('resize')"
     />
+    <img
+      v-else-if="imageActive"
+      ref="image"
+      class="screen-image"
+      :src="imageUrl || undefined"
+      alt="手机画面"
+      draggable="false"
+      @load="emit('imageLoaded')"
+      @error="emit('imageError')"
+    />
+    <div v-else-if="playbackError" class="screen-empty playback-error" role="alert">
+      <strong>无法播放实时画面</strong>
+      <span>{{ playbackError }}</span>
+      <t-button theme="primary" :loading="loadingStream" :disabled="!isReady" @click="emit('retry')"
+        ><template #icon><RefreshIcon /></template>重新连接</t-button
+      >
+    </div>
     <div v-else class="screen-empty">
-      <DesktopIcon /><strong>{{ isReady ? selectedModel : '暂无在线设备' }}</strong>
+      <DesktopIcon /><strong>{{
+        isReady ? selectedNote || selectedModel || selectedSerial : '暂无在线设备'
+      }}</strong>
+      <span v-if="isReady && selectedNote && selectedModel">{{ selectedModel }}</span>
       <span v-if="selectedSerial" class="mono">{{ selectedSerial }}</span>
       <template v-if="isReady">
         <span class="screen-empty-hint">启动后可直接点击、滑动操作手机</span>
@@ -77,7 +106,7 @@ defineExpose({ preview, video })
         >
       </div>
     </div>
-    <div v-if="activeStream && !canTouch" class="playback-status" role="status">
+    <div v-if="(activeStream || imageActive) && !canTouch" class="playback-status" role="status">
       <t-loading size="small" />{{ streamState === '实时视频' ? '等待控制通道' : streamState }}
     </div>
   </div>

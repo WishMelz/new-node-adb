@@ -7,6 +7,7 @@ import {
   Module,
   Req,
   UnauthorizedException,
+  ConflictException,
   UseGuards,
   HttpException,
   HttpStatus,
@@ -35,7 +36,7 @@ export type AuthRequest = FastifyRequest & { session: LoginSession };
 export class AuthService {
   private readonly salt = randomBytes(32);
   private readonly passwordHash: Buffer;
-  private readonly sessionKey: Buffer;
+  private readonly configuredPassword = loadPassword();
   private readonly failures = new Map<string, { count: number; until: number }>();
   private readonly challenges = new Map<
     string,
@@ -46,9 +47,40 @@ export class AuthService {
     private readonly factor: TwoFactorService = new TwoFactorService(),
     private readonly store: StorageService = factor.store,
   ) {
-    const password = loadPassword();
-    this.passwordHash = scryptSync(password, this.salt, 32);
-    this.sessionKey = scryptSync(password, 'adb-session-store-v1', 32);
+    this.passwordHash = this.configuredPassword
+      ? scryptSync(this.configuredPassword, this.salt, 32)
+      : Buffer.alloc(0);
+  }
+
+  mode(): 'password' | 'register' {
+    return this.configuredPassword || this.store.adminAccount() ? 'password' : 'register';
+  }
+
+  register(password: string, confirmation: string, ip: string) {
+    if (this.mode() === 'password') throw new ConflictException('管理员已注册，请直接登录');
+    if (password !== confirmation) throw new BadRequestException('两次输入的密码不一致');
+    this.checkAttempt(ip);
+    const salt = randomBytes(32);
+    const passwordHash = scryptSync(password, salt, 32);
+    const token = randomBytes(32).toString('base64url');
+    const session = {
+      id: randomBytes(16).toString('hex'),
+      expiresAt: Date.now() + settings.sessionHours * 3_600_000,
+    };
+    this.store.transaction((database) => {
+      const inserted = database
+        .prepare(
+          'INSERT OR IGNORE INTO admin_account (singleton, passwordSalt, passwordHash, createdAt) VALUES (1, ?, ?, ?)',
+        )
+        .run(salt.toString('base64'), passwordHash.toString('base64'), Date.now());
+      if (Number(inserted.changes) !== 1) throw new ConflictException('管理员已注册，请直接登录');
+      database.exec('DELETE FROM sessions');
+      database
+        .prepare('INSERT INTO sessions (tokenHash, id, expiresAt) VALUES (?, ?, ?)')
+        .run(this.hash(token), session.id, session.expiresAt);
+    });
+    this.failures.delete(ip);
+    return { token, session };
   }
 
   login(password: string, ip: string) {
@@ -59,6 +91,7 @@ export class AuthService {
   }
 
   beginLogin(password: string, ip: string, trustedToken?: string) {
+    if (this.mode() === 'register') throw new ConflictException('请先注册管理员');
     this.checkPassword(password, ip);
     if (!this.factor.enabled || this.factor.isTrusted(trustedToken)) {
       this.failures.delete(ip);
@@ -157,7 +190,19 @@ export class AuthService {
   }
   private checkPassword(password: string, ip: string) {
     this.checkAttempt(ip);
-    if (!timingSafeEqual(scryptSync(password, this.salt, 32), this.passwordHash)) {
+    const account = this.store.adminAccount();
+    if (!this.configuredPassword && !account) throw new ConflictException('请先注册管理员');
+    const expected = this.configuredPassword
+      ? this.passwordHash
+      : account
+        ? Buffer.from(account.passwordHash, 'base64')
+        : Buffer.alloc(0);
+    const actual = this.configuredPassword
+      ? scryptSync(password, this.salt, 32)
+      : account
+        ? scryptSync(password, Buffer.from(account.passwordSalt, 'base64'), 32)
+        : Buffer.alloc(0);
+    if (expected.length !== actual.length || !timingSafeEqual(actual, expected)) {
       this.failAttempt(ip);
       throw new UnauthorizedException('访问密码不正确');
     }
@@ -187,7 +232,7 @@ export class AuthService {
   }
 
   find(token?: string): LoginSession | undefined {
-    if (!token) return;
+    if (!token || this.mode() === 'register') return;
     return this.store.read((database) => {
       const session = database
         .prepare('SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND expiresAt > ?')
@@ -203,7 +248,13 @@ export class AuthService {
       });
   }
   private hash(token: string) {
-    return createHmac('sha256', this.sessionKey).update(token).digest('hex');
+    return createHmac('sha256', this.sessionKey()).update(token).digest('hex');
+  }
+  private sessionKey() {
+    if (this.configuredPassword) return scryptSync(this.configuredPassword, 'adb-session-store-v1', 32);
+    const account = this.store.adminAccount();
+    if (!account) throw new ConflictException('请先注册管理员');
+    return scryptSync(account.passwordHash, 'adb-session-store-v1', 32);
   }
 }
 
@@ -221,6 +272,10 @@ export class AuthGuard implements CanActivate {
 
 export class LoginDto {
   @IsString() @MinLength(1) password!: string;
+}
+
+export class RegisterDto extends LoginDto {
+  @IsString() @MinLength(1) confirmPassword!: string;
 }
 
 export class VerifyLoginDto {
@@ -244,7 +299,7 @@ class AuthController {
 
   @Get('config')
   config() {
-    return { mode: 'password', sessionHours: settings.sessionHours };
+    return { mode: this.auth.mode(), sessionHours: settings.sessionHours };
   }
 
   @Get('session')

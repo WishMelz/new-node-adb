@@ -6,16 +6,19 @@ const props = defineProps<{
   pending: boolean
   error: string
   sessionHours: number
+  mode?: 'password' | 'register'
   twoFactor?: boolean
   maxTrustDays?: number
 }>()
 const emit = defineEmits<{
   login: [password: string]
+  register: [password: string, confirmPassword: string]
   verify: [code: string, days: number]
   cancel: []
   retry: []
 }>()
 const password = ref('')
+const confirmPassword = ref('')
 const code = ref('')
 const remember = ref(false)
 const days = ref(7)
@@ -31,6 +34,7 @@ watch(
     else passwordInput.value?.focus()
   },
 )
+const registering = () => props.mode === 'register'
 function submit() {
   if (props.pending) return
   if (props.twoFactor) {
@@ -38,8 +42,10 @@ function submit() {
     code.value = ''
     return
   }
-  emit('login', password.value)
+  if (registering()) emit('register', password.value, confirmPassword.value)
+  else emit('login', password.value)
   password.value = ''
+  confirmPassword.value = ''
 }
 </script>
 
@@ -47,7 +53,9 @@ function submit() {
   <main class="login-view">
     <section class="login-panel" aria-labelledby="login-title">
       <div class="login-symbol"><LockOnIcon /></div>
-      <h1 id="login-title">{{ twoFactor ? '双重验证' : '登录 ADB Desk' }}</h1>
+      <h1 id="login-title">
+        {{ twoFactor ? '双重验证' : registering() ? '创建管理员账户' : '登录 ADB Desk' }}
+      </h1>
       <form @submit.prevent="submit">
         <template v-if="twoFactor">
           <label for="verification-code">验证码或恢复码</label>
@@ -84,7 +92,7 @@ function submit() {
           </div>
         </template>
         <template v-else>
-          <label for="password">访问密码</label>
+          <label for="password">{{ registering() ? '设置管理员密码' : '访问密码' }}</label>
           <input
             id="password"
             ref="passwordInput"
@@ -92,13 +100,28 @@ function submit() {
             class="password-input"
             name="password"
             type="password"
-            autocomplete="current-password"
+            :autocomplete="registering() ? 'new-password' : 'current-password'"
             required
             :disabled="pending"
             :aria-invalid="!!error"
             :aria-describedby="error ? 'login-error' : undefined"
             autofocus
           />
+          <template v-if="registering()">
+            <label for="confirm-password">确认管理员密码</label>
+            <input
+              id="confirm-password"
+              v-model="confirmPassword"
+              class="password-input"
+              name="confirm-password"
+              type="password"
+              autocomplete="new-password"
+              required
+              :disabled="pending"
+              :aria-invalid="!!error"
+              :aria-describedby="error ? 'login-error' : undefined"
+            />
+          </template>
         </template>
         <t-button
           theme="primary"
@@ -106,8 +129,9 @@ function submit() {
           size="large"
           block
           :loading="pending"
-          :disabled="(twoFactor ? !code : !password) || pending"
-          ><template #icon><EnterIcon /></template>{{ twoFactor ? '验证并登录' : '登录' }}</t-button
+          :disabled="(twoFactor ? !code : !password || (registering() && !confirmPassword)) || pending"
+          ><template #icon><EnterIcon /></template
+          >{{ twoFactor ? '验证并登录' : registering() ? '创建管理员账户' : '登录' }}</t-button
         >
         <t-button v-if="twoFactor" variant="text" block :disabled="pending" @click="emit('cancel')">
           <template #icon><ArrowLeftIcon /></template>返回密码登录

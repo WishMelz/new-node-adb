@@ -12,6 +12,9 @@ export interface DeviceRecord extends Omit<Device, 'state'> {
   note: string
 }
 
+export type VideoCodec = 'h264' | 'h265'
+export type PlaybackMode = 'auto' | VideoCodec | 'images'
+
 export interface StreamSummary {
   id: string
   serial: string
@@ -19,8 +22,10 @@ export interface StreamSummary {
   clientCount: number
   started: boolean
   deviceSize?: { width: number; height: number }
-  options?: { maxSize: number; maxFps: number; bitRate: number }
+  options?: { maxSize: number; maxFps: number; bitRate: number; videoCodec?: VideoCodec }
 }
+
+export type AuthMode = 'password' | 'register'
 
 const http = axios.create({ baseURL: '/api', timeout: 30_000, withCredentials: true })
 http.interceptors.response.use(
@@ -36,7 +41,7 @@ http.interceptors.response.use(
 )
 
 export async function authConfig() {
-  return (await http.get<{ mode: 'password'; sessionHours: number }>('/auth/config')).data
+  return (await http.get<{ mode: AuthMode; sessionHours: number }>('/auth/config')).data
 }
 export interface TwoFactorChallenge {
   requiresTwoFactor: true
@@ -59,6 +64,9 @@ export interface FactorSetup {
 }
 export async function login(password: string) {
   return (await http.post<{ expiresAt: number } | TwoFactorChallenge>('/auth/login', { password })).data
+}
+export async function register(password: string, confirmPassword: string) {
+  return (await http.post<{ expiresAt: number }>('/auth/register', { password, confirmPassword })).data
 }
 export async function verifyLogin(challenge: string, code: string, rememberDays: number) {
   return (await http.post<{ expiresAt: number }>('/auth/verify', { challenge, code, rememberDays })).data
@@ -128,9 +136,10 @@ export async function disconnectDevice(serial: string) {
 export async function getHost(serial: string) {
   return (await http.get<{ host: string }>(`/devices/${encodeURIComponent(serial)}/host`)).data
 }
-export async function screenshot(serial: string) {
-  return (await http.get(`/devices/${encodeURIComponent(serial)}/screenshot`, { responseType: 'blob' }))
-    .data as Blob
+export async function screenshot(serial: string, signal?: AbortSignal) {
+  return (
+    await http.get(`/devices/${encodeURIComponent(serial)}/screenshot`, { responseType: 'blob', signal })
+  ).data as Blob
 }
 export async function tap(serial: string, x: number, y: number) {
   return http.post('/devices/tap', { serial, x, y })
@@ -154,8 +163,8 @@ export async function openApp(serial: string, packageName: string) {
 export async function inputText(serial: string, text: string) {
   return http.post('/devices/text', { serial, text })
 }
-export async function startStream(serial: string) {
-  return (await http.post<StreamSummary>('/streams', { serial })).data
+export async function startStream(serial: string, videoCodec?: VideoCodec) {
+  return (await http.post<StreamSummary>('/streams', { serial, ...(videoCodec ? { videoCodec } : {}) })).data
 }
 export async function listStreams() {
   return (await http.get<StreamSummary[]>('/streams')).data

@@ -234,6 +234,115 @@ test('HTTP password authentication accepts short and long passwords without trun
   }
 });
 
+test('fresh deployments register one administrator and retain credentials across restarts', async () => {
+  const password = 'first-admin-password';
+  const previous = process.env.ADMIN_PASSWORD;
+  let recoveryCode: string;
+  delete process.env.ADMIN_PASSWORD;
+  let app = await createApp(path.join(sessionDirectory, 'missing-web'));
+  try {
+    const server = app.getHttpAdapter().getInstance();
+    const config = await server.inject({ method: 'GET', url: '/api/auth/config' });
+    assert.equal(config.statusCode, 200);
+    assert.equal(config.json().mode, 'register');
+    assert.throws(() => app.get(AuthService).login(password, 'before-register'), /请先注册管理员/);
+    assert.throws(
+      () => app.get(AuthService).checkSecurity(password, '', 'before-register'),
+      /请先注册管理员/,
+    );
+    assert.equal(
+      (
+        await server.inject({
+          method: 'GET',
+          url: '/api/auth/session',
+          headers: { cookie: 'adb_session=stale-session-from-previous-installation' },
+        })
+      ).statusCode,
+      401,
+    );
+    const mismatch = await server.inject({
+      method: 'POST',
+      url: '/api/auth/register',
+      payload: { password, confirmPassword: 'different-password' },
+    });
+    assert.equal(mismatch.statusCode, 400);
+    const results = await Promise.all(
+      [1, 2].map(() =>
+        server.inject({
+          method: 'POST',
+          url: '/api/auth/register',
+          payload: { password, confirmPassword: password },
+        }),
+      ),
+    );
+    assert.deepEqual(
+      results.map((response) => response.statusCode).sort((left, right) => left - right),
+      [201, 409],
+    );
+    const registered = results.find((response) => response.statusCode === 201)!;
+    const cookie = String(registered.headers['set-cookie']).split(';')[0];
+    assert.equal((await server.inject({ method: 'GET', url: '/api/auth/config' })).json().mode, 'password');
+    assert.equal(
+      (
+        await server.inject({
+          method: 'POST',
+          url: '/api/auth/register',
+          payload: { password, confirmPassword: password },
+        })
+      ).statusCode,
+      409,
+    );
+    const setup = await server.inject({
+      method: 'POST',
+      url: '/api/auth/two-factor/setup',
+      headers: { cookie },
+      payload: { password },
+    });
+    assert.equal(setup.statusCode, 201);
+    const factor = setup.json();
+    const enable = await server.inject({
+      method: 'POST',
+      url: '/api/auth/two-factor/enable',
+      headers: { cookie },
+      payload: { code: new TOTP({ secret: factor.secret }).generate() },
+    });
+    assert.equal(enable.statusCode, 201);
+    recoveryCode = enable.json().recoveryCodes[0];
+    assert.equal(
+      (await server.inject({ method: 'GET', url: '/api/auth/two-factor', headers: { cookie } })).json()
+        .enabled,
+      true,
+    );
+  } finally {
+    await app.close();
+  }
+  try {
+    app = await createApp(path.join(sessionDirectory, 'missing-web'));
+    const server = app.getHttpAdapter().getInstance();
+    assert.equal((await server.inject({ method: 'GET', url: '/api/auth/config' })).json().mode, 'password');
+    const login = await server.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { password },
+    });
+    assert.equal(login.statusCode, 201);
+    assert.equal(login.json().requiresTwoFactor, true);
+    const verified = await server.inject({
+      method: 'POST',
+      url: '/api/auth/verify',
+      payload: {
+        challenge: login.json().challenge,
+        code: recoveryCode,
+        rememberDays: 0,
+      },
+    });
+    assert.equal(verified.statusCode, 201);
+  } finally {
+    await app.close();
+    process.env.ADMIN_PASSWORD = previous;
+  }
+});
+
 test('stream configuration validates resource limits', () => {
   const defaults = parseSettings({});
   assert.equal(defaults.streamMaxSize, 1280);
@@ -653,6 +762,33 @@ test('stream ownership, concurrent replacement, exit cleanup and shutdown', asyn
   }
 });
 
+test('logout drains a stream start already in progress before selecting sessions', async () => {
+  let releaseReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    releaseReady = resolve;
+  });
+  const adb = {
+    ready: async () => ready,
+    size: async () => ({ width: 1080, height: 2400 }),
+    run: async () => {},
+    text: async () => '27190',
+    spawn: () => Object.assign(new EventEmitter(), { kill() {} }),
+  } as unknown as AdbService;
+  const streams = new StreamService(adb, { isActive: () => true } as unknown as AuthService);
+  const options = { maxSize: 1280, maxFps: 30, bitRate: 4_000_000 };
+  try {
+    const starting = streams.start('abc', 'owner', options);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const stopping = streams.stopForAuth('owner');
+    releaseReady();
+    await assert.rejects(starting, /取消/);
+    await stopping;
+    assert.equal(streams.list('owner').length, 0);
+  } finally {
+    await streams.onModuleDestroy();
+  }
+});
+
 test('stream HTTP defaults and limits protect capacity while allowing owner replacement', async (context) => {
   const previous = {
     streamMaxSize: settings.streamMaxSize,
@@ -702,7 +838,13 @@ test('stream HTTP defaults and limits protect capacity while allowing owner repl
       payload: { serial: 'abc' },
     });
     assert.equal(first.statusCode, 201);
-    assert.deepEqual(first.json().options, { maxSize: 1024, maxFps: 20, bitRate: 2_000_000 });
+    assert.deepEqual(first.json().options, {
+      maxSize: 1024,
+      maxFps: 20,
+      bitRate: 2_000_000,
+      videoCodec: 'h264',
+    });
+    assert.ok(launches[0].includes('video_codec=h264'));
     assert.ok(launches[0].includes('max_size=1024'));
     assert.ok(launches[0].includes('max_fps=20'));
     assert.ok(launches[0].includes('video_bit_rate=2000000'));
@@ -730,15 +872,30 @@ test('stream HTTP defaults and limits protect capacity while allowing owner repl
       payload: { serial: 'xyz', bitRate: 0 },
     });
     assert.equal(invalid.statusCode, 400);
+    for (const videoCodec of ['av1', 'h265;reboot', '', null]) {
+      const invalidCodec = await server.inject({
+        method: 'POST',
+        url: '/api/streams',
+        headers: headers[0],
+        payload: { serial: 'xyz', videoCodec },
+      });
+      assert.equal(invalidCodec.statusCode, 400);
+    }
     assert.ok(app.get(StreamService).get(first.json().id));
     const replaced = await server.inject({
       method: 'POST',
       url: '/api/streams',
       headers: headers[0],
-      payload: { serial: 'xyz', maxSize: 800, maxFps: 15, bitRate: 1_000_000 },
+      payload: { serial: 'xyz', maxSize: 800, maxFps: 15, bitRate: 1_000_000, videoCodec: 'h265' },
     });
     assert.equal(replaced.statusCode, 201);
-    assert.deepEqual(replaced.json().options, { maxSize: 800, maxFps: 15, bitRate: 1_000_000 });
+    assert.deepEqual(replaced.json().options, {
+      maxSize: 800,
+      maxFps: 15,
+      bitRate: 1_000_000,
+      videoCodec: 'h265',
+    });
+    assert.ok(launches.at(-1)!.includes('video_codec=h265'));
     assert.equal(app.get(StreamService).get(first.json().id), undefined);
     assert.ok(app.get(StreamService).get(second.json().id));
     const release = await server.inject({

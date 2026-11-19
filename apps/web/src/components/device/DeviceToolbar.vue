@@ -29,6 +29,7 @@ defineProps<{
   isReady: boolean
   canTouch: boolean
   connectionLabel: string
+  playbackMode: string
 }>()
 defineEmits<{
   select: [value: unknown]
@@ -40,6 +41,7 @@ defineEmits<{
   fullscreen: []
   add: []
   logs: []
+  playbackMode: [value: unknown]
 }>()
 </script>
 
@@ -80,6 +82,21 @@ defineEmits<{
     <span class="connection-status" role="status" :class="{ connected: isReady, live: canTouch }"
       ><i />{{ connectionLabel }}</span
     >
+    <label class="playback-picker">
+      <span class="visually-hidden">播放模式</span>
+      <t-select
+        :value="playbackMode"
+        :options="[
+          { label: '自动', value: 'auto' },
+          { label: 'H.264', value: 'h264' },
+          { label: 'H.265', value: 'h265' },
+          { label: '兼容图像', value: 'images' },
+        ]"
+        :disabled="switching || loadingStream"
+        aria-label="播放模式"
+        @change="$emit('playbackMode', $event)"
+      />
+    </label>
     <div class="control-actions">
       <t-button
         v-if="!activeStream"

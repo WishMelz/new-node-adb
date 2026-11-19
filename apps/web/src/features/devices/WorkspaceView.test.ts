@@ -6,6 +6,7 @@ import DeviceActionsPanel from '../../components/device/DeviceActionsPanel.vue'
 import DeviceConnectDialog from '../../components/device/DeviceConnectDialog.vue'
 import DeviceToolbar from '../../components/device/DeviceToolbar.vue'
 import DeviceRecordsDrawer from '../../components/device/DeviceRecordsDrawer.vue'
+import ScreenStage from '../../components/device/ScreenStage.vue'
 import ActivityDrawer from '../../components/layout/ActivityDrawer.vue'
 import WorkspaceView from './WorkspaceView.vue'
 
@@ -20,6 +21,7 @@ vi.mock('../../api', async (importOriginal) => ({
   openApp: vi.fn(),
   disconnectDevice: vi.fn(),
   updateDeviceRecord: vi.fn(),
+  screenshot: vi.fn(),
 }))
 
 describe('device workspace controls', () => {
@@ -46,6 +48,65 @@ describe('device workspace controls', () => {
     await flushPromises()
     return wrapper
   }
+
+  it('replaces the empty screen with an accessible playback error and a retry action', async () => {
+    wrapper = mount(ScreenStage, {
+      props: {
+        activeStream: false,
+        canTouch: false,
+        isReady: true,
+        selectedSerial: device.serial,
+        loadingStream: false,
+        loadingDevice: false,
+        deviceRecordsCount: 0,
+        streamState: '未启动',
+        playbackError: '当前浏览器缺少实时视频接口',
+      },
+      global: { plugins: [TDesign] },
+    })
+    expect(wrapper.get('[role="alert"]').text()).toContain('当前浏览器缺少实时视频接口')
+    expect(wrapper.text()).not.toContain('开始控制')
+    await wrapper.get('button').trigger('click')
+    expect(wrapper.emitted('retry')).toEqual([[]])
+    await wrapper.setProps({ isReady: false })
+    expect(wrapper.get('button').attributes()).toHaveProperty('disabled')
+    await wrapper.setProps({ isReady: true, playbackError: '', activeStream: true })
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.get('video').attributes()).toMatchObject({
+      playsinline: '',
+      disableremoteplayback: '',
+    })
+    await wrapper.setProps({ activeStream: false, imageActive: true, imageUrl: '', streamState: '等待图像' })
+    expect(wrapper.find('video').exists()).toBe(false)
+    expect(wrapper.get('img').attributes('src')).toBeUndefined()
+    expect(wrapper.get('[role="status"]').text()).toContain('等待图像')
+    await wrapper.setProps({ imageUrl: 'blob:test-image', canTouch: true })
+    expect(wrapper.get('img').attributes('src')).toBe('blob:test-image')
+    await wrapper.get('img').trigger('load')
+    await wrapper.get('img').trigger('error')
+    expect(wrapper.emitted('imageLoaded')).toEqual([[]])
+    expect(wrapper.emitted('imageError')).toEqual([[]])
+    expect(wrapper.find('[role="status"]').exists()).toBe(false)
+  })
+
+  it('routes mode selection and image running state through the workspace', async () => {
+    vi.mocked(api.screenshot).mockReturnValue(new Promise(() => {}))
+    const view = await workspace()
+    const toolbar = view.getComponent(DeviceToolbar)
+    expect(toolbar.props('playbackMode')).toBe('auto')
+    toolbar.vm.$emit('playbackMode', 'images')
+    await flushPromises()
+    expect(toolbar.props('playbackMode')).toBe('images')
+    expect(api.screenshot).not.toHaveBeenCalled()
+    toolbar.vm.$emit('start')
+    await flushPromises()
+    expect(toolbar.props('activeStream')).toBe(true)
+    expect(view.getComponent(ScreenStage).props()).toMatchObject({ activeStream: false, imageActive: true })
+    toolbar.vm.$emit('stop')
+    await flushPromises()
+    expect(toolbar.props('activeStream')).toBe(false)
+    expect(view.getComponent(ScreenStage).props('imageActive')).toBe(false)
+  })
 
   it('provides accessible close buttons for full-width records and activity drawers', async () => {
     const global = {
@@ -279,6 +340,7 @@ describe('device workspace controls', () => {
         isReady: true,
         canTouch: false,
         connectionLabel: '设备已连接',
+        playbackMode: 'auto',
       },
       global: { plugins: [TDesign] },
     })
@@ -287,6 +349,17 @@ describe('device workspace controls', () => {
     expect(wrapper.emitted('screenshot')).toHaveLength(1)
     expect(wrapper.emitted('add')).toHaveLength(1)
     expect(wrapper.find('[aria-label="更多"]').exists()).toBe(false)
+    const picker = wrapper.get('.playback-picker').getComponent({ name: 'TSelect' })
+    expect(picker.props('options')).toEqual([
+      { label: '自动', value: 'auto' },
+      { label: 'H.264', value: 'h264' },
+      { label: 'H.265', value: 'h265' },
+      { label: '兼容图像', value: 'images' },
+    ])
+    picker.vm.$emit('change', 'images')
+    expect(wrapper.emitted('playbackMode')).toEqual([['images']])
+    await wrapper.setProps({ loadingStream: true })
+    expect(picker.props('disabled')).toBe(true)
   })
 
   it('submits visible input forms and blocks empty or busy commands', async () => {

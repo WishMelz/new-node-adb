@@ -1,5 +1,4 @@
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { config as loadEnv } from 'dotenv';
 
@@ -40,13 +39,10 @@ export const settings = {
   scrcpyPath: process.env.SCRCPY_SERVER_PATH || path.join(root, 'vendor/scrcpy-server-v4.0'),
 };
 
-export function loadPassword(): string {
+export function loadPassword(): string | undefined {
   if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
-  const directory = settings.dataDir;
-  const filename = path.join(directory, 'bootstrap-password');
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  if (!existsSync(filename))
-    writeFileSync(filename, randomBytes(24).toString('base64url'), { flag: 'wx', mode: 0o600 });
+  const filename = path.join(settings.dataDir, 'bootstrap-password');
+  if (!existsSync(filename)) return undefined;
   const password = readFileSync(filename, 'utf8').trim();
   if (!password) throw new Error('Invalid bootstrap password: must not be empty');
   return password;

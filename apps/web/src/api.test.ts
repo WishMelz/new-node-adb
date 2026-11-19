@@ -19,6 +19,14 @@ describe('stream configuration', () => {
       const result = await configuredApi.startStream('test-device')
       expect(JSON.parse(adapter.mock.calls[0]![0].data)).toEqual({ serial: 'test-device' })
       expect(result.id).toBe('test-stream')
+      await configuredApi.startStream('test-device', 'h265')
+      expect(JSON.parse(adapter.mock.calls[1]![0].data)).toEqual({
+        serial: 'test-device',
+        videoCodec: 'h265',
+      })
+      const controller = new AbortController()
+      await configuredApi.screenshot('test-device', controller.signal)
+      expect(adapter.mock.calls[2]![0]).toMatchObject({ responseType: 'blob', signal: controller.signal })
     } finally {
       axios.defaults.adapter = original
     }
