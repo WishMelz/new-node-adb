@@ -15,6 +15,17 @@ export function parseSettings(environment: NodeJS.ProcessEnv) {
   }
   const secureCookie = environment.COOKIE_SECURE || 'false';
   if (!['true', 'false'].includes(secureCookie)) throw new Error('COOKIE_SECURE must be true or false');
+  const rawTrustProxy = (environment.TRUST_PROXY || 'false').trim();
+  const trustProxy: boolean | string =
+    rawTrustProxy === 'false'
+      ? false
+      : rawTrustProxy === 'true'
+        ? true
+        : /^(?:loopback|linklocal|uniquelocal|[0-9a-fA-F:.,/]+)$/.test(rawTrustProxy)
+          ? rawTrustProxy
+          : (() => {
+              throw new Error('TRUST_PROXY must be false, true, loopback, or a valid IP/CIDR list');
+            })();
   const production = environment.NODE_ENV === 'production';
   const dataDir = path.resolve(root, environment.DATA_DIR || '.data');
   return {
@@ -22,6 +33,7 @@ export function parseSettings(environment: NodeJS.ProcessEnv) {
     dataDir,
     databaseFile: path.join(dataDir, 'adb-desk.sqlite'),
     secureCookie: secureCookie === 'true',
+    trustProxy,
     sessionHours: integer('SESSION_HOURS', 24, 24, 8760),
     loginMaxAttempts: integer('LOGIN_MAX_ATTEMPTS', 5, 1, 100),
     loginWindowMinutes: integer('LOGIN_WINDOW_MINUTES', 15, 1, 1440),

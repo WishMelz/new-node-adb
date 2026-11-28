@@ -17,7 +17,16 @@ import { DeviceRecordsService } from './devices';
 import { createApp } from './main';
 import { loadPassword, parseSettings, root, settings } from './config';
 import { adbEnvironment, inspectAdbIdentity, prepareAdbIdentity } from './adb-identity';
-import { encodeTouchControl, StreamService, StreamSession } from './stream';
+import {
+  encodeClipboardControl,
+  encodeDeviceActionControl,
+  encodeDisplayPowerControl,
+  encodeKeyControl,
+  encodeScrollControl,
+  encodeTouchControl,
+  StreamService,
+  StreamSession,
+} from './stream';
 import { StorageService } from './storage';
 
 process.env.ADMIN_PASSWORD = randomBytes(24).toString('hex');
@@ -131,6 +140,10 @@ test('authentication configuration rejects unsafe or unusable values', () => {
   ])
     assert.throws(() => parseSettings(environment));
   assert.equal(parseSettings({ COOKIE_SECURE: 'true' }).secureCookie, true);
+  assert.equal(parseSettings({ TRUST_PROXY: 'loopback' }).trustProxy, 'loopback');
+  assert.equal(parseSettings({ TRUST_PROXY: 'true' }).trustProxy, true);
+  assert.equal(parseSettings({}).trustProxy, false);
+  assert.throws(() => parseSettings({ TRUST_PROXY: 'invalid proxy!' }));
   assert.equal(parseSettings({ PUBLIC_ORIGIN: 'https://legacy.example.com' }).secureCookie, false);
   const password = process.env.ADMIN_PASSWORD;
   try {
@@ -1230,8 +1243,10 @@ test('Nest serves the frontend and API on the same listener without masking miss
   const html =
     '<!doctype html><html><body><div id="app"></div><script src="/assets/app.js"></script></body></html>';
   const javascript = 'globalThis.appLoaded = true;';
+  const largeJs = `/* ${'a'.repeat(2048)} */`;
   writeFileSync(path.join(webRoot, 'index.html'), html);
   writeFileSync(path.join(webRoot, 'assets/app.js'), javascript);
+  writeFileSync(path.join(webRoot, 'assets/large.js'), largeJs);
   const app = await createApp(webRoot);
   try {
     const server = app.getHttpAdapter().getInstance();
@@ -1239,12 +1254,23 @@ test('Nest serves the frontend and API on the same listener without masking miss
       const response = await server.inject(url);
       assert.equal(response.statusCode, 200);
       assert.match(String(response.headers['content-type']), /text\/html/);
+      assert.equal(response.headers['cache-control'], 'no-cache');
       assert.equal(response.body, html);
     }
     const asset = await server.inject('/assets/app.js');
     assert.equal(asset.statusCode, 200);
     assert.match(String(asset.headers['content-type']), /javascript/);
+    assert.equal(asset.headers['cache-control'], 'public, max-age=31536000, immutable');
     assert.equal(asset.body, javascript);
+    const compressed = await server.inject({
+      url: '/assets/large.js',
+      headers: { 'accept-encoding': 'br, gzip' },
+    });
+    assert.equal(compressed.statusCode, 200);
+    assert.equal(compressed.headers['content-encoding'], 'br');
+    assert.match(String(compressed.headers.vary), /Accept-Encoding/i);
+    const { brotliDecompressSync } = await import('node:zlib');
+    assert.equal(brotliDecompressSync(compressed.rawPayload).toString('utf8'), largeJs);
     const health = await server.inject('/api/health');
     assert.equal(health.statusCode, 200);
     assert.equal(health.json().ok, true);
@@ -1622,3 +1648,240 @@ for (const slowViewer of [false, true])
       }
     },
   );
+
+test('stream skips adb push when versioned remote scrcpy jar is already cached on device', async () => {
+  const calls: string[][] = [];
+  const adb = {
+    ready: async () => {},
+    size: async () => ({ width: 1080, height: 2400 }),
+    run: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === 'shell' && args[1] === 'test')
+        return { stdout: Buffer.from('ok\n'), stderr: Buffer.alloc(0) };
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    },
+    text: async () => '27195',
+    spawn: () => Object.assign(new EventEmitter(), { kill() {} }),
+  } as unknown as AdbService;
+  const streams = new StreamService(adb, { isActive: () => true } as unknown as AuthService);
+  try {
+    await streams.start('abc', 'owner');
+    assert.equal(
+      calls.some((args) => args[0] === 'push'),
+      false,
+    );
+  } finally {
+    await streams.onModuleDestroy();
+  }
+});
+
+test('screenshot route validates maxSize, returns device dimensions and deduplicates concurrent captures', async (context) => {
+  const app = await createApp();
+  try {
+    const server = app.getHttpAdapter().getInstance();
+    const login = await server.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { password: process.env.ADMIN_PASSWORD },
+    });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0] };
+    assert.equal(
+      (await server.inject({ url: '/api/devices/abc/screenshot?maxSize=100', headers })).statusCode,
+      400,
+    );
+    const sharp = (await import('sharp')).default;
+    const png = await sharp({
+      create: { width: 1080, height: 1920, channels: 3, background: '#087e70' },
+    })
+      .png()
+      .toBuffer();
+    const adb = app.get(AdbService);
+    let captures = 0;
+    context.mock.method(adb, 'ready', async () => ({
+      serial: 'abc',
+      state: 'device',
+      model: 'Test',
+      transport: 'usb' as const,
+    }));
+    context.mock.method(adb, 'run', async () => {
+      captures += 1;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { stdout: png, stderr: Buffer.alloc(0) };
+    });
+    const [first, second] = await Promise.all([
+      server.inject({ url: '/api/devices/abc/screenshot?maxSize=640', headers }),
+      server.inject({ url: '/api/devices/abc/screenshot?maxSize=640', headers }),
+    ]);
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 200);
+    assert.equal(captures, 1);
+    assert.equal(first.headers['x-device-width'], '1080');
+    assert.equal(first.headers['x-device-height'], '1920');
+    const meta = await sharp(first.rawPayload).metadata();
+    assert.equal(meta.format, 'webp');
+    assert.ok((meta.height ?? 0) <= 640);
+  } finally {
+    await app.close();
+  }
+});
+
+test('strict CSP, wireless pairing, stream config and scrcpy key/scroll/clipboard encoders work as expected', async (context) => {
+  const keyBuf = encodeKeyControl({ key: 'home' });
+  assert.equal(keyBuf.length, 28);
+  assert.deepEqual([keyBuf[0], keyBuf[1], keyBuf.readInt32BE(2)], [0, 0, 3]);
+  assert.deepEqual([keyBuf[14], keyBuf[15], keyBuf.readInt32BE(16)], [0, 1, 3]);
+  const scrollBuf = encodeScrollControl({
+    x: 100,
+    y: 200,
+    screenWidth: 1080,
+    screenHeight: 2400,
+    horizontal: 0,
+    vertical: -1,
+  });
+  assert.equal(scrollBuf.length, 21);
+  assert.equal(scrollBuf[0], 3);
+  assert.equal(scrollBuf.readInt16BE(15), -32767);
+  const clipBuf = encodeClipboardControl({ text: '你好 ADB', paste: true });
+  assert.equal(clipBuf[0], 9);
+  assert.equal(clipBuf[9], 1);
+  assert.equal(clipBuf.subarray(14).toString('utf8'), '你好 ADB');
+  assert.throws(() => encodeClipboardControl({ text: '', paste: true }));
+  assert.deepEqual(encodeDisplayPowerControl(false), Buffer.from([10, 0]));
+  assert.deepEqual(encodeDisplayPowerControl(true), Buffer.from([10, 1]));
+  assert.deepEqual(encodeDeviceActionControl('expandNotifications'), Buffer.from([5]));
+  assert.deepEqual(encodeDeviceActionControl('rotateDevice'), Buffer.from([11]));
+
+  const app = await createApp();
+  try {
+    const server = app.getHttpAdapter().getInstance();
+    const health = await server.inject('/api/health');
+    const csp = String(health.headers['content-security-policy'] || '');
+    assert.match(csp, /default-src 'self'/);
+    assert.match(csp, /connect-src 'self' ws: wss:/);
+    assert.ok(!csp.includes('upgrade-insecure-requests'));
+
+    const login = await server.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { password: process.env.ADMIN_PASSWORD },
+    });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0] };
+
+    const streamCfg = await server.inject({ url: '/api/streams/config', headers });
+    assert.equal(streamCfg.statusCode, 200);
+    assert.deepEqual(streamCfg.json(), {
+      maxSize: settings.streamMaxSize,
+      maxFps: settings.streamMaxFps,
+      bitRate: settings.streamBitRate,
+    });
+
+    const adb = app.get(AdbService);
+    const textMock = context.mock.method(
+      adb,
+      'text',
+      async () => 'Successfully paired to 192.168.1.10:37123',
+    );
+    assert.equal(
+      (
+        await server.inject({
+          method: 'POST',
+          url: '/api/devices/pair',
+          headers,
+          payload: { host: '192.168.1.10:37123', code: '12345' },
+        })
+      ).statusCode,
+      400,
+    );
+    const paired = await server.inject({
+      method: 'POST',
+      url: '/api/devices/pair',
+      headers,
+      payload: { host: '192.168.1.10:37123', code: '123456' },
+    });
+    assert.equal(paired.statusCode, 201);
+    assert.deepEqual(textMock.mock.calls[0]?.arguments[0], ['pair', '192.168.1.10:37123', '123456']);
+
+    context.mock.method(adb, 'ready', async () => ({
+      serial: 'abc',
+      state: 'device',
+      model: 'Test',
+      transport: 'usb' as const,
+    }));
+    textMock.mock.mockImplementation(
+      async () => 'package:com.zeta.app\npackage:com.alpha.app\npackage:invalid\npackage:com.alpha.app\n',
+    );
+    const apps = await server.inject({ url: '/api/devices/abc/apps', headers });
+    assert.equal(apps.statusCode, 200);
+    assert.deepEqual(apps.json(), { packages: ['com.alpha.app', 'com.zeta.app'] });
+
+    const envBlocked = await server.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      headers,
+      payload: {
+        currentPassword: process.env.ADMIN_PASSWORD,
+        newPassword: 'new-password-123',
+        confirmPassword: 'new-password-123',
+      },
+    });
+    assert.equal(envBlocked.statusCode, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+test('registered database admin can change password online and invalidates old session', async () => {
+  const previous = process.env.ADMIN_PASSWORD;
+  delete process.env.ADMIN_PASSWORD;
+  const app = await createApp(path.join(sessionDirectory, 'missing-web'));
+  try {
+    const server = app.getHttpAdapter().getInstance();
+    const registered = await server.inject({
+      method: 'POST',
+      url: '/api/auth/register',
+      payload: { password: 'old-admin-password', confirmPassword: 'old-admin-password' },
+    });
+    assert.equal(registered.statusCode, 201);
+    const headers = { cookie: String(registered.headers['set-cookie']).split(';')[0] };
+    assert.equal(
+      (await server.inject({ url: '/api/auth/two-factor', headers })).json().canChangePassword,
+      true,
+    );
+
+    const changed = await server.inject({
+      method: 'POST',
+      url: '/api/auth/password',
+      headers,
+      payload: {
+        currentPassword: 'old-admin-password',
+        newPassword: 'new-admin-password',
+        confirmPassword: 'new-admin-password',
+      },
+    });
+    assert.equal(changed.statusCode, 201);
+    assert.equal((await server.inject({ url: '/api/auth/session', headers })).statusCode, 401);
+    assert.equal(
+      (
+        await server.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { password: 'old-admin-password' },
+        })
+      ).statusCode,
+      401,
+    );
+    assert.equal(
+      (
+        await server.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { password: 'new-admin-password' },
+        })
+      ).statusCode,
+      201,
+    );
+  } finally {
+    await app.close();
+    process.env.ADMIN_PASSWORD = previous;
+  }
+});

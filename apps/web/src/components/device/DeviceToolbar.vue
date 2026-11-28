@@ -8,7 +8,7 @@ import {
   PlayCircleIcon,
   RefreshIcon,
   StopCircleIcon,
-  ViewModuleIcon,
+  SystemLogIcon,
 } from 'tdesign-icons-vue-next'
 
 interface DeviceOption {
@@ -30,6 +30,8 @@ defineProps<{
   canTouch: boolean
   connectionLabel: string
   playbackMode: string
+  streamQuality?: string
+  tooltipsDisabled?: boolean
 }>()
 defineEmits<{
   select: [value: unknown]
@@ -42,6 +44,7 @@ defineEmits<{
   add: []
   logs: []
   playbackMode: [value: unknown]
+  streamQuality: [value: unknown]
 }>()
 </script>
 
@@ -56,7 +59,7 @@ defineEmits<{
         placeholder="选择设备"
         @change="$emit('select', $event)"
       />
-      <t-tooltip content="添加设备"
+      <t-tooltip content="添加设备" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button
           shape="square"
           variant="outline"
@@ -65,7 +68,7 @@ defineEmits<{
           @click="$emit('add')"
           ><template #icon><AddIcon /></template></t-button
       ></t-tooltip>
-      <t-tooltip content="刷新设备"
+      <t-tooltip content="刷新设备" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button
           shape="square"
           variant="text"
@@ -74,7 +77,7 @@ defineEmits<{
           @click="$emit('refresh')"
           ><template #icon><RefreshIcon /></template></t-button
       ></t-tooltip>
-      <t-tooltip content="已保存设备"
+      <t-tooltip content="已保存设备" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button shape="square" variant="text" aria-label="已保存设备" @click="$emit('records')"
           ><template #icon><HistoryIcon /></template></t-button
       ></t-tooltip>
@@ -97,6 +100,20 @@ defineEmits<{
         @change="$emit('playbackMode', $event)"
       />
     </label>
+    <label v-if="playbackMode !== 'images'" class="quality-picker">
+      <span class="visually-hidden">视频画质</span>
+      <t-select
+        :value="streamQuality ?? 'balanced'"
+        :options="[
+          { label: '省流', value: 'low' },
+          { label: '均衡', value: 'balanced' },
+          { label: '高清', value: 'high' },
+        ]"
+        :disabled="switching || loadingStream"
+        aria-label="视频画质"
+        @change="$emit('streamQuality', $event)"
+      />
+    </label>
     <div class="control-actions">
       <t-button
         v-if="!activeStream"
@@ -109,7 +126,7 @@ defineEmits<{
       <t-button v-else theme="danger" variant="outline" @click="$emit('stop')"
         ><StopCircleIcon />停止</t-button
       >
-      <t-tooltip content="下载截图"
+      <t-tooltip content="下载截图" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button
           shape="square"
           variant="text"
@@ -119,7 +136,11 @@ defineEmits<{
           @click="$emit('screenshot')"
           ><template #icon><DownloadIcon /></template></t-button
       ></t-tooltip>
-      <t-tooltip :content="fullscreen || expanded ? '退出全屏' : '全屏'"
+      <t-tooltip
+        :content="fullscreen || expanded ? '退出全屏' : '全屏'"
+        :z-index="1200"
+        destroy-on-close
+        :disabled="tooltipsDisabled"
         ><t-button
           shape="square"
           variant="text"
@@ -127,9 +148,9 @@ defineEmits<{
           @click="$emit('fullscreen')"
           ><FullscreenExit1Icon v-if="fullscreen || expanded" /><Fullscreen1Icon v-else /></t-button
       ></t-tooltip>
-      <t-tooltip content="操作日志"
+      <t-tooltip content="操作日志" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button shape="square" variant="text" aria-label="操作日志" @click="$emit('logs')"
-          ><template #icon><ViewModuleIcon /></template></t-button
+          ><template #icon><SystemLogIcon /></template></t-button
       ></t-tooltip>
     </div>
   </div>

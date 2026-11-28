@@ -22,6 +22,7 @@ const emit = defineEmits<{
   pointermove: [event: PointerEvent]
   pointerup: [event: PointerEvent]
   pointercancel: []
+  wheel: [event: WheelEvent]
   add: []
   start: []
   refresh: []
@@ -49,6 +50,7 @@ defineExpose({ preview, video, image })
     @pointerup="emit('pointerup', $event)"
     @pointercancel="emit('pointercancel')"
     @lostpointercapture="emit('pointercancel')"
+    @wheel="emit('wheel', $event)"
     @contextmenu.prevent
   >
     <video

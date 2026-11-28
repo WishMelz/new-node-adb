@@ -134,9 +134,11 @@ describe('device workspace controls', () => {
     expect(wrapper.emitted('update:visible')).toEqual([[false]])
     wrapper.unmount()
     wrapper = mount(ActivityDrawer, {
-      props: { visible: true, items: [] },
+      props: { visible: true, items: [{ id: 1, time: '12:00:00', message: '操作失败', level: 'error' }] },
       global,
     })
+    await wrapper.get('button[aria-label="清空日志"]').trigger('click')
+    expect(wrapper.emitted('clear')).toEqual([[]])
     await wrapper.get('button[aria-label="关闭操作日志"]').trigger('click')
     expect(wrapper.emitted('update:visible')).toEqual([[false]])
   })

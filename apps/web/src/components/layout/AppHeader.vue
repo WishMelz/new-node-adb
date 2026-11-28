@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { DesktopIcon, LockOnIcon, LogoutIcon } from 'tdesign-icons-vue-next'
 
-defineProps<{ authenticated: boolean }>()
+defineProps<{ authenticated: boolean; tooltipsDisabled?: boolean }>()
 defineEmits<{ logout: []; security: [] }>()
 </script>
 
@@ -9,11 +9,11 @@ defineEmits<{ logout: []; security: [] }>()
   <header class="topbar">
     <div class="brand-lockup"><DesktopIcon /><strong>ADB Desk</strong><span>安卓控制台</span></div>
     <div v-if="authenticated" class="topbar-actions">
-      <t-tooltip content="安全设置"
+      <t-tooltip content="安全设置" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button shape="square" variant="text" aria-label="安全设置" @click="$emit('security')"
           ><LockOnIcon /></t-button
       ></t-tooltip>
-      <t-tooltip content="退出登录"
+      <t-tooltip content="退出登录" :z-index="1200" destroy-on-close :disabled="tooltipsDisabled"
         ><t-button shape="square" variant="text" aria-label="退出登录" @click="$emit('logout')"
           ><LogoutIcon /></t-button
       ></t-tooltip>

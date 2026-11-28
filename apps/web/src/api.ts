@@ -14,6 +14,12 @@ export interface DeviceRecord extends Omit<Device, 'state'> {
 
 export type VideoCodec = 'h264' | 'h265'
 export type PlaybackMode = 'auto' | VideoCodec | 'images'
+export type StreamQuality = 'low' | 'balanced' | 'high'
+export interface StreamQualityOptions {
+  maxSize?: number
+  maxFps?: number
+  bitRate?: number
+}
 
 export interface StreamSummary {
   id: string
@@ -55,6 +61,7 @@ export interface SecurityStatus {
   trustedBrowsers: number
   trustedUntil: number | null
   recoveryCodesRemaining: number
+  canChangePassword?: boolean
 }
 export interface FactorSetup {
   secret: string
@@ -82,6 +89,19 @@ export async function enableTwoFactor(code: string) {
 }
 export async function changeTwoFactor(action: 'disable' | 'revoke-trusted', password: string, code: string) {
   return http.post(`/auth/two-factor/${action}`, { password, code })
+}
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+  confirmPassword: string,
+  code?: string,
+) {
+  return http.post('/auth/password', {
+    currentPassword,
+    newPassword,
+    confirmPassword,
+    ...(code ? { code } : {}),
+  })
 }
 export async function session() {
   return (await http.get<{ expiresAt: number }>('/auth/session')).data
@@ -127,8 +147,23 @@ export function connectionErrorMessage(error: unknown) {
   return '连接失败，请确认设备地址、端口及 ADB 调试状态'
 }
 
+export function pairErrorMessage(error: unknown) {
+  if (isAxiosError(error)) {
+    if (error.response?.status === 401) return '登录已过期，请重新登录'
+    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' || error.response?.status === 504)
+      return '配对超时，请确认手机处于配对界面且网络可达'
+    const detail: unknown = error.response?.data?.message
+    if (typeof detail === 'string' && error.response && error.response.status < 500) return detail
+    if (!error.response) return '无法访问服务，请检查网络后重试'
+  }
+  return '无线配对失败，请检查地址、端口和 6 位配对码'
+}
+
 export async function connectDevice(host: string) {
   return http.post('/devices/connect', { host })
+}
+export async function pairDevice(host: string, code: string) {
+  return http.post('/devices/pair', { host, code })
 }
 export async function disconnectDevice(serial: string) {
   return http.post('/devices/disconnect', { serial })
@@ -136,10 +171,28 @@ export async function disconnectDevice(serial: string) {
 export async function getHost(serial: string) {
   return (await http.get<{ host: string }>(`/devices/${encodeURIComponent(serial)}/host`)).data
 }
-export async function screenshot(serial: string, signal?: AbortSignal) {
-  return (
-    await http.get(`/devices/${encodeURIComponent(serial)}/screenshot`, { responseType: 'blob', signal })
-  ).data as Blob
+export async function listDeviceApps(serial: string) {
+  return (await http.get<{ packages: string[] }>(`/devices/${encodeURIComponent(serial)}/apps`)).data.packages
+}
+export async function screenshot(
+  serial: string,
+  signal?: AbortSignal,
+  maxSize?: number,
+  onMeta?: (deviceSize: { width: number; height: number }) => void,
+) {
+  const response = await http.get(`/devices/${encodeURIComponent(serial)}/screenshot`, {
+    responseType: 'blob',
+    signal,
+    params: maxSize ? { maxSize } : undefined,
+  })
+  if (onMeta) {
+    const width = Number(response.headers['x-device-width'])
+    const height = Number(response.headers['x-device-height'])
+    if (Number.isSafeInteger(width) && width > 0 && Number.isSafeInteger(height) && height > 0) {
+      onMeta({ width, height })
+    }
+  }
+  return response.data as Blob
 }
 export async function tap(serial: string, x: number, y: number) {
   return http.post('/devices/tap', { serial, x, y })
@@ -163,8 +216,14 @@ export async function openApp(serial: string, packageName: string) {
 export async function inputText(serial: string, text: string) {
   return http.post('/devices/text', { serial, text })
 }
-export async function startStream(serial: string, videoCodec?: VideoCodec) {
-  return (await http.post<StreamSummary>('/streams', { serial, ...(videoCodec ? { videoCodec } : {}) })).data
+export async function startStream(serial: string, videoCodec?: VideoCodec, options?: StreamQualityOptions) {
+  return (
+    await http.post<StreamSummary>('/streams', {
+      serial,
+      ...(videoCodec ? { videoCodec } : {}),
+      ...(options ?? {}),
+    })
+  ).data
 }
 export async function listStreams() {
   return (await http.get<StreamSummary[]>('/streams')).data

@@ -493,4 +493,79 @@ describe('stream request lifecycle', () => {
     expect(showError).not.toHaveBeenCalled()
     await stream.stop()
   })
+
+  it.each([
+    [4002, '积压过慢'],
+    [4003, '编码器异常退出'],
+    [4004, '控制连接过载'],
+  ])('reports targeted error messages for custom close code %i', async (code, expected) => {
+    await startVideo()
+    sockets[0].onclose?.call(sockets[0], new CloseEvent('close', { code }))
+    expect(stream.playbackError.value).toContain(expected)
+    expect(showError).toHaveBeenCalledWith(null, stream.playbackError.value)
+  })
+
+  it('forwards quality presets and sends key/clipboard messages over the live control channel', async () => {
+    await stream.changeQuality('low')
+    await startVideo()
+    expect(api.startStream).toHaveBeenLastCalledWith(serial.value, 'h264', {
+      maxSize: 720,
+      maxFps: 20,
+      bitRate: 1_200_000,
+    })
+    const send = vi.spyOn(sockets[0], 'send')
+    sockets[0].onmessage?.call(
+      sockets[0],
+      new MessageEvent('message', { data: JSON.stringify({ type: 'control', ready: true }) }),
+    )
+    stream.playing()
+    expect(stream.sendKey('back')).toBe(true)
+    expect(stream.sendClipboard('你好世界')).toBe(true)
+    expect(stream.toggleDisplayPower()).toBe(true)
+    expect(stream.displayOff.value).toBe(true)
+    expect(stream.sendDeviceAction('expandNotifications')).toBe(true)
+    expect(stream.sendDeviceAction('rotateDevice')).toBe(true)
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'key', key: 'back' }))
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'clipboard', text: '你好世界', paste: true }))
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'displayPower', on: false }))
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'action', action: 'expandNotifications' }))
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'action', action: 'rotateDevice' }))
+  })
+
+  it('maps scaled image taps back to physical device coordinates reported by response headers', async () => {
+    vi.mocked(api.screenshot).mockImplementationOnce(async (_serial, _signal, maxSize, onMeta) => {
+      expect(maxSize).toBe(960)
+      onMeta?.({ width: 1080, height: 1920 })
+      return new Blob(['scaled'])
+    })
+    const preview = document.createElement('div')
+    preview.setPointerCapture = vi.fn()
+    preview.hasPointerCapture = vi.fn(() => true)
+    preview.releasePointerCapture = vi.fn()
+    vi.spyOn(preview, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 360,
+      height: 640,
+    } as DOMRect)
+    const image = document.createElement('img')
+    Object.defineProperties(image, { naturalWidth: { value: 540 }, naturalHeight: { value: 960 } })
+    stream.stage.value = { preview, video: null, image }
+    stream.playbackMode.value = 'images'
+    await stream.start()
+    await flushPromises()
+    image.src = stream.imageUrl.value
+    stream.imageLoaded()
+    const pointer = {
+      pointerId: 1,
+      isPrimary: true,
+      button: 0,
+      clientX: 180,
+      clientY: 320,
+      preventDefault: vi.fn(),
+    } as unknown as PointerEvent
+    stream.down(pointer)
+    stream.up(pointer)
+    expect(api.tap).toHaveBeenCalledExactlyOnceWith(serial.value, 540, 960)
+  })
 })

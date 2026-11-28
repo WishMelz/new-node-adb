@@ -1,6 +1,6 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { isAxiosError } from 'axios'
-import { MessagePlugin } from 'tdesign-vue-next'
+import { MessagePlugin } from 'tdesign-vue-next/es/message'
 import * as api from '../../api'
 
 export function authErrorMessage(error: unknown) {
@@ -16,11 +16,17 @@ export function useAuth() {
   const checking = ref(true)
   const pending = ref(false)
   const error = ref('')
+  const retryable = ref(false)
   const sessionHours = ref(24)
   const mode = ref<api.AuthMode>('password')
   const challenge = ref<api.TwoFactorChallenge | null>(null)
   let version = 0
   let expiryTimer: ReturnType<typeof setTimeout> | undefined
+
+  function isServiceError(failure: unknown) {
+    if (!isAxiosError(failure) || !failure.response) return true
+    return failure.response.status >= 500
+  }
 
   function expire(message = '登录已过期，请重新登录') {
     version += 1
@@ -29,6 +35,7 @@ export function useAuth() {
     authenticated.value = false
     challenge.value = null
     error.value = message
+    retryable.value = false
   }
 
   function accept(expiresAt: number) {
@@ -40,6 +47,7 @@ export function useAuth() {
     authenticated.value = true
     challenge.value = null
     error.value = ''
+    retryable.value = false
     const schedule = () => {
       const remaining = expiresAt - Date.now()
       if (remaining <= 0) expire()
@@ -52,6 +60,7 @@ export function useAuth() {
     const current = ++version
     checking.value = true
     error.value = ''
+    retryable.value = false
     try {
       const config = await api.authConfig()
       if (current !== version) return
@@ -62,6 +71,7 @@ export function useAuth() {
     } catch (failure) {
       if (current === version && (!isAxiosError(failure) || failure.response?.status !== 401)) {
         error.value = authErrorMessage(failure)
+        retryable.value = isServiceError(failure)
       }
     } finally {
       if (current === version) checking.value = false
@@ -73,6 +83,7 @@ export function useAuth() {
     const current = ++version
     pending.value = true
     error.value = ''
+    retryable.value = false
     try {
       const result = await api.login(password)
       if (current !== version) return
@@ -85,7 +96,10 @@ export function useAuth() {
         )
       } else accept(result.expiresAt)
     } catch (failure) {
-      if (current === version) error.value = authErrorMessage(failure)
+      if (current === version) {
+        error.value = authErrorMessage(failure)
+        retryable.value = isServiceError(failure)
+      }
     } finally {
       pending.value = false
     }
@@ -95,11 +109,13 @@ export function useAuth() {
     if (!password || pending.value) return
     if (password !== confirmPassword) {
       error.value = '两次输入的密码不一致'
+      retryable.value = false
       return
     }
     const current = ++version
     pending.value = true
     error.value = ''
+    retryable.value = false
     try {
       const result = await api.register(password, confirmPassword)
       if (current === version) {
@@ -111,9 +127,14 @@ export function useAuth() {
         if (isAxiosError(failure) && failure.response?.status === 409) {
           error.value = '管理员已注册，请重新检查服务'
           mode.value = 'password'
+          retryable.value = true
         } else if (isAxiosError(failure) && failure.response?.status === 400) {
           error.value = '两次输入的密码不一致'
-        } else error.value = authErrorMessage(failure)
+          retryable.value = false
+        } else {
+          error.value = authErrorMessage(failure)
+          retryable.value = isServiceError(failure)
+        }
       }
     } finally {
       pending.value = false
@@ -126,6 +147,7 @@ export function useAuth() {
     clearTimeout(expiryTimer)
     challenge.value = null
     error.value = ''
+    retryable.value = false
   }
 
   async function verify(code: string, rememberDays: number) {
@@ -185,6 +207,7 @@ export function useAuth() {
     checking,
     pending,
     error,
+    retryable,
     sessionHours,
     mode,
     challenge,

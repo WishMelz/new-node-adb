@@ -12,6 +12,7 @@ const {
   checking,
   pending,
   error,
+  retryable,
   sessionHours,
   mode,
   challenge,
@@ -25,16 +26,26 @@ const {
 watch(authenticated, () => {
   if (!authenticated.value) securityOpen.value = false
 })
+function openSecurity() {
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+  securityOpen.value = true
+}
 </script>
 
 <template>
   <div class="app-shell">
-    <AppHeader :authenticated="authenticated" @logout="logout" @security="securityOpen = true" />
+    <AppHeader
+      :authenticated="authenticated"
+      :tooltips-disabled="securityOpen"
+      @logout="logout"
+      @security="openSecurity"
+    />
     <main v-if="checking" class="login-view"><t-loading text="正在检查会话" /></main>
     <LoginView
       v-else-if="!authenticated"
       :pending="pending"
       :error="error"
+      :retryable="retryable"
       :session-hours="sessionHours"
       :mode="mode"
       :two-factor="!!challenge"

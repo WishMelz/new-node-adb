@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AxiosError, AxiosHeaders } from 'axios'
 import { defineComponent } from 'vue'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
-import TDesign, { MessagePlugin } from 'tdesign-vue-next'
+import TDesign from 'tdesign-vue-next'
+import { MessagePlugin } from 'tdesign-vue-next/es/message'
 import * as api from '../../api'
 import { authErrorMessage, useAuth } from './useAuth'
 import LoginView from './LoginView.vue'
@@ -21,8 +22,8 @@ vi.mock('../../api', () => ({
   enableTwoFactor: vi.fn(),
   changeTwoFactor: vi.fn(),
 }))
-vi.mock('tdesign-vue-next', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('tdesign-vue-next')>()),
+vi.mock('tdesign-vue-next/es/message', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('tdesign-vue-next/es/message')>()),
   MessagePlugin: { error: vi.fn(), success: vi.fn() },
 }))
 

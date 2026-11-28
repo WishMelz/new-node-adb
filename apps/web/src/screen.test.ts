@@ -68,4 +68,22 @@ describe('live single-pointer touch', () => {
     expect(failed.begin(1, { x: 10, y: 20 }, size)).toBe(false)
     expect(failed.begin(2, { x: 10, y: 20 }, size)).toBe(false)
   })
+  it('supports concurrent multi-touch pointers when configured and releases all on cancel', () => {
+    const messages: TouchMessage[] = []
+    const touch = new ScreenTouch((message) => {
+      messages.push(message)
+      return true
+    }, 5)
+    expect(touch.begin(1, { x: 10, y: 20 }, size)).toBe(true)
+    expect(touch.begin(2, { x: 40, y: 60 }, size)).toBe(true)
+    touch.move(2, { x: 50, y: 70 }, size)
+    touch.cancel()
+    expect(messages.map((m) => [m.pointerId, m.action])).toEqual([
+      [1, 'down'],
+      [2, 'down'],
+      [2, 'move'],
+      [1, 'cancel'],
+      [2, 'cancel'],
+    ])
+  })
 })

@@ -55,6 +55,7 @@ export function validateFactor(value: unknown): FactorState {
 export class StorageService {
   readonly filename = settings.databaseFile;
   private active?: DatabaseSync;
+  private inTransaction = false;
 
   constructor() {
     mkdirSync(path.dirname(this.filename), { recursive: true, mode: 0o700 });
@@ -112,19 +113,21 @@ export class StorageService {
   read<Result>(operation: (database: DatabaseSync) => Result): Result {
     if (this.active) return operation(this.active);
     const database = new DatabaseSync(this.filename);
+    this.active = database;
     try {
       database.exec('PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;');
       return operation(database);
     } finally {
+      this.active = undefined;
       database.close();
     }
   }
 
   transaction<Result>(operation: (database: DatabaseSync) => Result): Result {
-    if (this.active) return operation(this.active);
+    if (this.inTransaction && this.active) return operation(this.active);
     return this.read((database) => {
       database.exec('BEGIN IMMEDIATE');
-      this.active = database;
+      this.inTransaction = true;
       try {
         const result = operation(database);
         database.exec('COMMIT');
@@ -135,7 +138,7 @@ export class StorageService {
         } catch {}
         throw error;
       } finally {
-        this.active = undefined;
+        this.inTransaction = false;
       }
     });
   }

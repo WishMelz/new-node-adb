@@ -133,7 +133,7 @@ COOKIE_SECURE=true
 
 Compose 项目和服务名称均为 `adb-desk`，默认使用 Docker Hub 镜像 `wishmelz/adb-desk:latest`，支持 `linux/amd64` 和 `linux/arm64`，Docker 自动选择对应架构；默认容器名为 `adb-desk-adb-desk-1`（可由 `-p` 或 `COMPOSE_PROJECT_NAME` 覆盖项目名）。
 
-部署配置需要 `compose.yaml` 和 `.env`，使用 Docker Compose 2.24.0 或更新版本。`1.0.2` 已发布到 Docker Hub，`latest` 同步指向该版本，包含下述环境变量配置和 ADB 密钥持久化，可直接拉取镜像，无需安装 Node.js 或本地构建。如需固定版本，将 Compose 的 `image` 改为 `wishmelz/adb-desk:1.0.2`。自行构建时，在源码目录执行 `npm ci`、`npm run build` 和 `docker build -t adb-desk:local .`，再将 `image` 改为 `adb-desk:local`。保留 `DATA_DIR` 内的数据，不要将其打入镜像或公开分享。
+部署配置需要 `compose.yaml` 和 `.env`，使用 Docker Compose 2.24.0 或更新版本。`1.0.3` 已发布到 Docker Hub，`latest` 同步指向该版本，包含下述环境变量配置、ADB 密钥持久化与最新前端/控制/性能优化，可直接拉取镜像，无需安装 Node.js 或本地构建。如需固定版本，将 Compose 的 `image` 改为 `wishmelz/adb-desk:1.0.3`。自行构建时，在源码目录执行 `npm ci`、`npm run build` 和 `docker build -t adb-desk:local .`，再将 `image` 改为 `adb-desk:local`。保留 `DATA_DIR` 内的数据，不要将其打入镜像或公开分享。
 
 当前 Dockerfile 使用 Node.js `22.23.4-slim`，只启动后端应用进程，不安装 Nginx，也不运行 Vite。密码和端口统一填写在 Compose 同目录的 `.env` 配置文件中，可参考 `.env.example`：
 
@@ -314,6 +314,7 @@ STREAM_MAX_SESSIONS=1
 | `SCRCPY_SERVER_PATH`   | `vendor/scrcpy-server-v4.0` 的绝对路径                                                                     |
 | `SCRCPY_VERSION`       | `4.0`；必须与二进制版本匹配                                                                                |
 | `COOKIE_SECURE`        | `false`；HTTPS 部署设为 `true`                                                                             |
+| `TRUST_PROXY`          | `false`；前置 Nginx 反代按真实来源 IP 限流时可设为 `loopback`、`true` 或受信任代理 IP/CIDR                 |
 
 登录 Cookie 与服务端会话有效期一致，默认登录后 24 小时内无需重复登录，不按午夜清零。刷新页面、关闭后重新打开浏览器或重启服务不会使未到期会话失效；主动退出、清除 Cookie、更换访问密码或被新登录替换后需重新登录。会话以令牌摘要而非明文令牌保存在 `DATA_DIR/adb-desk.sqlite`，部署时需保留并保护整个数据目录。从旧版内存会话升级后需重新登录一次；旧版 JSON 含多个会话时，迁移仅保留最后创建且未过期的会话。
 

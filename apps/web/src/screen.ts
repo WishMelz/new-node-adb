@@ -41,11 +41,14 @@ export interface TouchMessage {
 }
 
 export class ScreenTouch {
-  private active: TouchMessage | null = null
-  constructor(private readonly send: (message: TouchMessage) => boolean) {}
+  private readonly active = new Map<number, TouchMessage>()
+  constructor(
+    private readonly send: (message: TouchMessage) => boolean,
+    private readonly maxPointers = 1,
+  ) {}
 
   begin(pointerId: number, point: { x: number; y: number }, size: Size) {
-    if (this.active) return false
+    if (this.active.has(pointerId) || this.active.size >= this.maxPointers) return false
     const message: TouchMessage = {
       type: 'touch',
       action: 'down',
@@ -55,31 +58,33 @@ export class ScreenTouch {
       screenHeight: size.height,
     }
     if (!this.send(message)) return false
-    this.active = message
+    this.active.set(pointerId, message)
     return true
   }
 
   move(pointerId: number, point: { x: number; y: number }, size: Size) {
-    if (!this.active || this.active.pointerId !== pointerId) return
-    if (size.width !== this.active.screenWidth || size.height !== this.active.screenHeight) {
+    const current = this.active.get(pointerId)
+    if (!current) return
+    if (size.width !== current.screenWidth || size.height !== current.screenHeight) {
       this.cancel()
       return
     }
-    const message: TouchMessage = { ...this.active, ...point, action: 'move' }
-    this.active = this.send(message) ? message : null
+    const message: TouchMessage = { ...current, ...point, action: 'move' }
+    if (this.send(message)) this.active.set(pointerId, message)
+    else this.active.delete(pointerId)
   }
 
   end(pointerId: number) {
-    if (!this.active || this.active.pointerId !== pointerId) return
-    const message: TouchMessage = { ...this.active, action: 'up' }
-    this.active = null
-    this.send(message)
+    const current = this.active.get(pointerId)
+    if (!current) return
+    this.active.delete(pointerId)
+    this.send({ ...current, action: 'up' })
   }
 
   cancel() {
-    if (!this.active) return
-    const message: TouchMessage = { ...this.active, action: 'cancel' }
-    this.active = null
-    this.send(message)
+    if (!this.active.size) return
+    const items = [...this.active.values()]
+    this.active.clear()
+    for (const current of items) this.send({ ...current, action: 'cancel' })
   }
 }

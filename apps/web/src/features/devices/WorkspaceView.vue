@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { MessagePlugin } from 'tdesign-vue-next/es/message'
 import * as api from '../../api'
 import ActivityDrawer from '../../components/layout/ActivityDrawer.vue'
 import DeviceRecordsDrawer from '../../components/device/DeviceRecordsDrawer.vue'
@@ -17,9 +18,14 @@ import { useWorkspace } from '../../composables/useWorkspace'
 const props = defineProps<{ securityOpen?: boolean }>()
 const activity = reactive(useActivity())
 const connectOpen = ref(false)
+const connectDialog = ref<InstanceType<typeof DeviceConnectDialog> | null>(null)
+const pairing = ref(false)
+const pairError = ref('')
 const recordsOpen = ref(false)
 const logsOpen = ref(false)
 const packageName = ref('')
+const installedApps = ref<string[]>([])
+const loadingApps = ref(false)
 const input = ref('')
 const usingRecord = ref('')
 const interactionBlocked = computed(
@@ -87,6 +93,7 @@ async function selectDevice(value: unknown) {
     await stream.stop()
     if (disposed) return
     devices.selectedSerial = serial
+    installedApps.value = []
     if (serial) activity.log(`当前设备：${serial}`)
   } catch (error) {
     if (!disposed) activity.showError(error, '切换设备失败')
@@ -142,35 +149,109 @@ async function useRecord(record: api.DeviceRecord) {
   }
 }
 
+async function pairDevice(rawHost: string, code: string) {
+  if (devices.commandPending || devices.connecting || pairing.value || devices.switching || disposed) return
+  let address: string
+  try {
+    address = api.normalizeDeviceHost(rawHost)
+  } catch (error) {
+    pairError.value = error instanceof Error ? error.message : '配对地址无效'
+    return
+  }
+  pairError.value = ''
+  pairing.value = true
+  devices.commandPending = true
+  try {
+    await api.pairDevice(address, code)
+    if (disposed) return
+    activity.log(`无线配对成功：${address}`)
+    void MessagePlugin.success({ content: '无线配对成功，请填写调试端口完成连接', duration: 4000 })
+    const hostPart = address.slice(0, address.lastIndexOf(':'))
+    connectDialog.value?.switchToConnect(`${hostPart}:`)
+  } catch (error) {
+    if (!disposed) {
+      pairError.value = api.pairErrorMessage(error)
+      activity.log(`无线配对失败（${address}）：${pairError.value}`, 'error')
+    }
+  } finally {
+    pairing.value = false
+    devices.commandPending = false
+  }
+}
+
 function actionKey(key: string, label: string) {
+  if (stream.sendKey(key)) {
+    activity.log(label)
+    return true
+  }
   return devices.run((serial) => api.key(serial, key), label)
 }
 function launchApp() {
   const name = packageName.value.trim()
   if (name) return devices.run((serial) => api.openApp(serial, name), '应用已启动')
 }
+async function loadInstalledApps() {
+  if (!devices.canCommand || loadingApps.value || disposed) return
+  const serial = devices.selectedSerial
+  loadingApps.value = true
+  try {
+    const list = await api.listDeviceApps(serial)
+    if (!disposed && serial === devices.selectedSerial) {
+      installedApps.value = list
+      activity.log(`已读取 ${list.length} 个第三方应用`)
+    }
+  } catch (error) {
+    if (!disposed && serial === devices.selectedSerial) activity.showError(error, '读取应用列表失败')
+  } finally {
+    loadingApps.value = false
+  }
+}
 async function sendText() {
   const text = input.value
-  if (
-    text.trim() &&
-    (await devices.run((serial) => api.inputText(serial, text), '文本已发送')) &&
-    input.value === text
-  )
+  if (!text.trim()) return
+  if (stream.sendClipboard(text)) {
+    activity.log('文本已粘贴发送')
+    if (input.value === text) input.value = ''
+    return
+  }
+  if ((await devices.run((serial) => api.inputText(serial, text), '文本已发送')) && input.value === text)
     input.value = ''
 }
+function blurActiveElement() {
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+}
+
+watch(connectOpen, (open) => {
+  if (!open) {
+    devices.hostError = ''
+    devices.host = ''
+  }
+})
+
 async function openConnect() {
+  blurActiveElement()
   stream.cancel()
   await layout.leaveFullscreen()
-  if (!disposed) connectOpen.value = true
+  if (!disposed) {
+    devices.hostError = ''
+    connectOpen.value = true
+  }
 }
 async function openRecords() {
+  blurActiveElement()
   await layout.leaveFullscreen()
   if (disposed) return
+  const fromConnect = connectOpen.value
   connectOpen.value = false
+  if (fromConnect) {
+    await new Promise((resolve) => setTimeout(resolve, 260))
+    if (disposed) return
+  }
   recordsOpen.value = true
   await records.refresh()
 }
 async function openLogs() {
+  blurActiveElement()
   stream.cancel()
   await layout.leaveFullscreen()
   if (disposed) return
@@ -205,7 +286,10 @@ onBeforeUnmount(() => {
       :can-touch="stream.canTouch"
       :connection-label="connectionLabel"
       :playback-mode="stream.playbackMode"
+      :stream-quality="stream.streamQuality"
+      :tooltips-disabled="interactionBlocked"
       @playback-mode="stream.changeMode"
+      @stream-quality="stream.changeQuality"
       @select="selectDevice"
       @refresh="refreshDevices"
       @records="openRecords"
@@ -239,6 +323,7 @@ onBeforeUnmount(() => {
           @pointermove="stream.move"
           @pointerup="stream.up"
           @pointercancel="stream.cancel"
+          @wheel="stream.wheel"
           @add="openConnect"
           @start="stream.start"
           @refresh="refreshDevices"
@@ -264,7 +349,14 @@ onBeforeUnmount(() => {
         :can-command="devices.canCommand"
         :can-swipe-home="stream.canTouch && !stream.swipingHome && !interactionBlocked"
         :can-disconnect="devices.selected?.transport === 'network' && devices.canCommand"
+        :can-send-utf8="stream.canTouch && !stream.imageActive"
+        :display-off="stream.displayOff"
+        :installed-apps="installedApps"
+        :loading-apps="loadingApps"
         @swipe-home="stream.swipeHome"
+        @toggle-display-power="stream.toggleDisplayPower"
+        @device-action="stream.sendDeviceAction"
+        @load-apps="loadInstalledApps"
         @disconnect="disconnect"
         @action="actionKey"
         @send="sendText"
@@ -272,14 +364,19 @@ onBeforeUnmount(() => {
       />
     </div>
     <DeviceConnectDialog
+      ref="connectDialog"
       v-model:visible="connectOpen"
       v-model:host="devices.host"
       :host-error="devices.hostError"
       :connecting="devices.connecting"
+      :pairing="pairing"
+      :pair-error="pairError"
       :busy="devices.commandPending || devices.switching || stream.loading"
       :can-detect="devices.ready"
       :record-count="records.records.length"
       @connect="connect"
+      @pair="pairDevice"
+      @clear-pair-error="pairError = ''"
       @detect="devices.detectHost"
       @records="openRecords"
     />
@@ -298,6 +395,6 @@ onBeforeUnmount(() => {
       @remove="records.remove"
       @update-note="records.updateNote"
     />
-    <ActivityDrawer v-model:visible="logsOpen" :items="activity.items" />
+    <ActivityDrawer v-model:visible="logsOpen" :items="activity.items" @clear="activity.clear" />
   </main>
 </template>

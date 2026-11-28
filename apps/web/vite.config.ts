@@ -2,8 +2,23 @@ import { fileURLToPath } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+const buildOptions = {
+  rollupOptions: {
+    output: {
+      manualChunks(id: string) {
+        if (!id.includes('node_modules')) return undefined
+        if (id.includes('jmuxer')) return 'jmuxer'
+        if (id.includes('tdesign-icons-vue-next')) return 'tdesign-icons'
+        if (id.includes('tdesign-vue-next') || id.includes('@popperjs')) return 'tdesign'
+        if (id.includes('/vue/') || id.includes('@vue/') || id.includes('axios')) return 'vendor'
+        return undefined
+      },
+    },
+  },
+}
+
 export default defineConfig(({ command, mode }) => {
-  if (command === 'build') return { plugins: [vue()] }
+  if (command === 'build') return { plugins: [vue()], build: buildOptions }
   const root = fileURLToPath(new URL('../..', import.meta.url))
   const environment = loadEnv(mode, root, ['DEV_WEB_PORT', 'DEV_API_PORT'])
   function port(name: string, fallback: number) {

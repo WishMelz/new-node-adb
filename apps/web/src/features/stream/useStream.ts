@@ -15,6 +15,11 @@ type MediaSourceWindow = Window & {
   ManagedMediaSource?: typeof MediaSource
 }
 
+const qualityPresets: Record<Exclude<api.StreamQuality, 'balanced'>, api.StreamQualityOptions> = {
+  low: { maxSize: 720, maxFps: 20, bitRate: 1_200_000 },
+  high: { maxSize: 1600, maxFps: 60, bitRate: 6_000_000 },
+}
+
 export function useStream(
   serial: Ref<string>,
   ready: Ref<boolean>,
@@ -27,9 +32,11 @@ export function useStream(
   const loading = ref(false)
   const loadingScreen = ref(false)
   const controlReady = ref(false)
+  const displayOff = ref(false)
   const swipingHome = ref(false)
   const playbackError = ref('')
   const playbackMode = ref<api.PlaybackMode>('auto')
+  const streamQuality = ref<api.StreamQuality>('balanced')
   const effectiveMode = ref<Exclude<api.PlaybackMode, 'auto'> | null>(null)
   const imageActive = ref(false)
   const imageUrl = ref('')
@@ -59,9 +66,10 @@ export function useStream(
   let imageTimer: ReturnType<typeof setTimeout> | undefined
   let imageAbort: AbortController | undefined
   let imageSize = { width: 0, height: 0 }
+  let imageDeviceSize: { width: number; height: number } | undefined
   let imageGesture: { pointerId: number; x: number; y: number; startedAt: number } | undefined
   let imageCommandPending = false
-  const touch = new ScreenTouch((message) => {
+  function sendControl(payload: object) {
     if (!socket || socket.readyState !== WebSocket.OPEN || !controlReady.value) return false
     if (socket.bufferedAmount > 64 * 1024) {
       controlReady.value = false
@@ -69,13 +77,15 @@ export function useStream(
       showError(null, '控制连接拥塞，已停止控制')
       return false
     }
-    socket.send(JSON.stringify(message))
+    socket.send(JSON.stringify(payload))
     return true
-  })
+  }
+  const touch = new ScreenTouch((message) => sendControl(message), 10)
 
   function cleanup(preservePlaybackError = false) {
     cancel()
     controlReady.value = false
+    displayOff.value = false
     clearTimeout(playbackTimer)
     clearTimeout(imageTimer)
     imageAbort?.abort()
@@ -84,6 +94,7 @@ export function useStream(
     imageUrl.value = ''
     imageActive.value = false
     imageSize = { width: 0, height: 0 }
+    imageDeviceSize = undefined
     effectiveMode.value = null
     removeVideoErrorListener?.()
     removeVideoErrorListener = undefined
@@ -150,7 +161,10 @@ export function useStream(
       }
       const videoCodec = mode === 'h265' ? 'h265' : 'h264'
       const codecLabel = videoCodec === 'h265' ? 'H.265' : 'H.264'
-      const stream = await api.startStream(selected, videoCodec)
+      const preset = streamQuality.value === 'balanced' ? undefined : qualityPresets[streamQuality.value]
+      const stream = preset
+        ? await api.startStream(selected, videoCodec, preset)
+        : await api.startStream(selected, videoCodec)
       if (disposed || version !== generation || selected !== serial.value) {
         await api.stopStream(stream.id)
         return
@@ -209,6 +223,12 @@ export function useStream(
           generation += 1
           cleanup()
           window.dispatchEvent(new Event('auth-replaced'))
+        } else if (event.code === 4002) {
+          fail('网络传输积压过慢，已停止投屏，可尝试重新连接或切换兼容图像')
+        } else if (event.code === 4003) {
+          fail('设备编码器异常退出，请切换 H.264 或兼容图像模式')
+        } else if (event.code === 4004) {
+          fail('控制连接过载，请重新连接')
         } else fail()
       }
       socket.onerror = () => fail()
@@ -246,12 +266,18 @@ export function useStream(
     imageAbort = new AbortController()
     playbackTimer = setTimeout(() => imageFailed('等待图像超时，请检查网络后重新连接'), 20_000)
     try {
-      const blob = await api.screenshot(selected, imageAbort.signal)
+      let nextDeviceSize: { width: number; height: number } | undefined
+      const blob = await api.screenshot(selected, imageAbort.signal, 960, (meta) => {
+        nextDeviceSize = meta
+      })
+      imageAbort = undefined
       if (disposed || version !== generation || selected !== serial.value) return
+      imageDeviceSize = nextDeviceSize
       const previous = imageUrl.value
       imageUrl.value = URL.createObjectURL(blob)
       if (previous) URL.revokeObjectURL(previous)
     } catch (error) {
+      imageAbort = undefined
       if (!disposed && version === generation) imageFailed('图像获取失败，请检查设备连接后重试', error)
     }
   }
@@ -290,6 +316,40 @@ export function useStream(
     if (resume) await start()
   }
 
+  async function changeQuality(value: unknown) {
+    if (!['low', 'balanced', 'high'].includes(value as string) || loading.value || disposed) return
+    const next = value as api.StreamQuality
+    if (next === streamQuality.value) return
+    streamQuality.value = next
+    if (active.value) await start()
+  }
+
+  function sendKey(keyName: string) {
+    if (imageActive.value || !canTouch.value || blocked.value || disposed) return false
+    return sendControl({ type: 'key', key: keyName })
+  }
+
+  function sendClipboard(text: string) {
+    if (imageActive.value || !canTouch.value || blocked.value || disposed || !text) return false
+    return sendControl({ type: 'clipboard', text, paste: true })
+  }
+
+  function toggleDisplayPower() {
+    if (imageActive.value || !canTouch.value || blocked.value || disposed) return false
+    const nextOff = !displayOff.value
+    if (!sendControl({ type: 'displayPower', on: !nextOff })) return false
+    displayOff.value = nextOff
+    log(nextOff ? '已关闭设备实体屏幕（保持投屏）' : '已点亮设备实体屏幕')
+    return true
+  }
+
+  function sendDeviceAction(action: 'expandNotifications' | 'rotateDevice') {
+    if (imageActive.value || !canTouch.value || blocked.value || disposed) return false
+    if (!sendControl({ type: 'action', action })) return false
+    log(action === 'expandNotifications' ? '已展开通知栏' : '已切换屏幕旋转')
+    return true
+  }
+
   async function screenshot() {
     if (!ready.value || loadingScreen.value || disposed) return
     const selected = serial.value
@@ -312,18 +372,21 @@ export function useStream(
     }
   }
 
-  function coordinates(event: PointerEvent, clamp = false) {
+  function coordinates(event: { clientX: number; clientY: number }, clamp = false) {
     const rect = stage.value?.preview?.getBoundingClientRect()
-    const size = imageActive.value
+    const media = imageActive.value
       ? imageSize
       : { width: stage.value?.video?.videoWidth || 0, height: stage.value?.video?.videoHeight || 0 }
+    const device = imageActive.value ? (imageDeviceSize ?? imageSize) : media
     if (!rect) return null
-    const point = mapPoint(event.clientX, event.clientY, rect, size, size, clamp)
-    return point ? { point, size } : null
+    const point = mapPoint(event.clientX, event.clientY, rect, media, device, clamp)
+    return point ? { point, size: media } : null
   }
   function down(event: PointerEvent) {
-    if (!event.isPrimary || event.button !== 0 || !canTouch.value || blocked.value || swipingHome.value)
-      return
+    const allowPointer = imageActive.value
+      ? event.isPrimary && event.button === 0
+      : event.pointerType === 'touch' || (event.isPrimary && event.button === 0)
+    if (!allowPointer || !canTouch.value || blocked.value || swipingHome.value) return
     const mapped = coordinates(event)
     if (!mapped) return
     event.preventDefault()
@@ -335,6 +398,22 @@ export function useStream(
     }
     if (touch.begin(event.pointerId, mapped.point, mapped.size))
       stage.value?.preview?.setPointerCapture(event.pointerId)
+  }
+  function wheel(event: WheelEvent) {
+    if (imageActive.value || !canTouch.value || blocked.value || swipingHome.value) return
+    const mapped = coordinates(event)
+    if (!mapped) return
+    event.preventDefault()
+    const normalize = (delta: number) => Math.max(-1, Math.min(1, -delta / 120))
+    sendControl({
+      type: 'scroll',
+      x: mapped.point.x,
+      y: mapped.point.y,
+      screenWidth: mapped.size.width,
+      screenHeight: mapped.size.height,
+      horizontal: normalize(event.deltaX),
+      vertical: normalize(event.deltaY),
+    })
   }
   function move(event: PointerEvent) {
     if (imageActive.value) {
@@ -388,9 +467,21 @@ export function useStream(
   async function imageCommand(command: (selected: string) => Promise<unknown>) {
     if (imageCommandPending || disposed || !canTouch.value || blocked.value) return
     const version = generation
+    const selected = serial.value
     imageCommandPending = true
     try {
-      await command(serial.value)
+      await command(selected)
+      if (
+        !disposed &&
+        version === generation &&
+        imageActive.value &&
+        selected === serial.value &&
+        !imageAbort &&
+        !document.hidden
+      ) {
+        clearTimeout(imageTimer)
+        imageTimer = setTimeout(() => void loadImage(version, selected), 200)
+      }
     } catch (error) {
       if (version === generation && !disposed) showError(error, '设备操作失败')
     } finally {
@@ -400,7 +491,11 @@ export function useStream(
   async function swipeHome() {
     if (!canTouch.value || blocked.value || swipingHome.value || disposed) return
     if (imageActive.value) {
-      const { width, height } = imageSize
+      const target = imageDeviceSize ?? imageSize
+      const { width, height } =
+        imageSize.width > imageSize.height !== target.width > target.height
+          ? { width: target.height, height: target.width }
+          : target
       await imageCommand((selected) =>
         api.swipe(
           selected,
@@ -462,7 +557,24 @@ export function useStream(
       if (!disposed) showError(error, '停止失败')
     }
   }
+  const onVisibilityChange = () => {
+    if (
+      !document.hidden &&
+      !disposed &&
+      imageActive.value &&
+      state.value === '兼容图像' &&
+      !imageAbort &&
+      serial.value
+    ) {
+      clearTimeout(imageTimer)
+      const version = generation
+      const selected = serial.value
+      void loadImage(version, selected)
+    }
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange)
   onBeforeUnmount(() => {
+    document.removeEventListener('visibilitychange', onVisibilityChange)
     disposed = true
     pageLeaving()
   })
@@ -473,8 +585,11 @@ export function useStream(
     loadingScreen,
     state,
     canTouch,
+    displayOff,
     swipingHome,
     swipeHome,
+    toggleDisplayPower,
+    sendDeviceAction,
     start,
     stop,
     end,
@@ -482,11 +597,13 @@ export function useStream(
     down,
     move,
     up,
+    wheel,
     cancel,
     playing,
     pageLeaving,
     playbackError,
     playbackMode,
+    streamQuality,
     effectiveMode,
     modeLabel,
     running,
@@ -495,5 +612,8 @@ export function useStream(
     imageLoaded,
     imageFailed,
     changeMode,
+    changeQuality,
+    sendKey,
+    sendClipboard,
   }
 }

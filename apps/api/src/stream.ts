@@ -15,8 +15,8 @@ import {
   UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import net from 'node:net';
 import type { ChildProcess } from 'node:child_process';
 import type { RawData, WebSocket } from 'ws';
@@ -46,6 +46,42 @@ export interface TouchControl {
   screenWidth: number;
   screenHeight: number;
 }
+export type ControlKeyName =
+  'home' | 'back' | 'recent' | 'wake' | 'sleep' | 'enter' | 'volumeUp' | 'volumeDown';
+export interface KeyControl {
+  key: ControlKeyName;
+}
+export interface ScrollControl {
+  x: number;
+  y: number;
+  screenWidth: number;
+  screenHeight: number;
+  horizontal: number;
+  vertical: number;
+}
+export interface ClipboardControl {
+  text: string;
+  paste: boolean;
+}
+export type DeviceActionName = 'expandNotifications' | 'rotateDevice';
+type ControlMessage =
+  | ({ type: 'touch' } & TouchControl)
+  | ({ type: 'key' } & KeyControl)
+  | ({ type: 'scroll' } & ScrollControl)
+  | ({ type: 'clipboard' } & ClipboardControl)
+  | { type: 'displayPower'; on: boolean }
+  | { type: 'action'; action: DeviceActionName };
+
+const controlKeyCodes: Record<ControlKeyName, number> = {
+  home: 3,
+  back: 4,
+  recent: 187,
+  wake: 224,
+  sleep: 223,
+  enter: 66,
+  volumeUp: 24,
+  volumeDown: 25,
+};
 
 export function encodeTouchControl(event: TouchControl) {
   const actionCode: Record<TouchAction, number> = { down: 0, up: 1, move: 2, cancel: 1 };
@@ -74,7 +110,74 @@ export function encodeTouchControl(event: TouchControl) {
   return message;
 }
 
-function parseTouchControl(data: RawData): TouchControl | undefined {
+export function encodeKeyControl(event: KeyControl) {
+  if (!Object.hasOwn(controlKeyCodes, event.key)) throw new Error('按键无效');
+  const keycode = controlKeyCodes[event.key];
+  const down = Buffer.alloc(14);
+  down.writeUInt8(0, 0);
+  down.writeUInt8(0, 1);
+  down.writeInt32BE(keycode, 2);
+  const up = Buffer.alloc(14);
+  up.writeUInt8(0, 0);
+  up.writeUInt8(1, 1);
+  up.writeInt32BE(keycode, 2);
+  return Buffer.concat([down, up]);
+}
+
+function floatToI16FixedPoint(value: number) {
+  const clamped = Math.max(-1, Math.min(1, value));
+  return Math.max(-32768, Math.min(32767, Math.round(clamped * 32767)));
+}
+
+export function encodeScrollControl(event: ScrollControl) {
+  if (![event.x, event.y].every(Number.isInteger) || event.x < 0 || event.y < 0)
+    throw new Error('滚轮坐标无效');
+  if (
+    ![event.screenWidth, event.screenHeight].every(Number.isInteger) ||
+    event.screenWidth < 1 ||
+    event.screenHeight < 1 ||
+    event.screenWidth > 65535 ||
+    event.screenHeight > 65535
+  )
+    throw new Error('滚轮画面尺寸无效');
+  if (event.x >= event.screenWidth || event.y >= event.screenHeight) throw new Error('滚轮坐标超出画面');
+  if (!Number.isFinite(event.horizontal) || !Number.isFinite(event.vertical)) throw new Error('滚轮增量无效');
+  const message = Buffer.alloc(21);
+  message.writeUInt8(3, 0);
+  message.writeInt32BE(event.x, 1);
+  message.writeInt32BE(event.y, 5);
+  message.writeUInt16BE(event.screenWidth, 9);
+  message.writeUInt16BE(event.screenHeight, 11);
+  message.writeInt16BE(floatToI16FixedPoint(event.horizontal), 13);
+  message.writeInt16BE(floatToI16FixedPoint(event.vertical), 15);
+  message.writeInt32BE(0, 17);
+  return message;
+}
+
+export function encodeClipboardControl(event: ClipboardControl) {
+  if (typeof event.text !== 'string' || !event.text.length || [...event.text].length > 2000)
+    throw new Error('剪贴板文本无效');
+  const payload = Buffer.from(event.text, 'utf8');
+  if (payload.length > 8192) throw new Error('剪贴板文本过长');
+  const header = Buffer.alloc(14);
+  header.writeUInt8(9, 0);
+  header.writeBigUInt64BE(0n, 1);
+  header.writeUInt8(event.paste ? 1 : 0, 9);
+  header.writeUInt32BE(payload.length, 10);
+  return Buffer.concat([header, payload]);
+}
+
+export function encodeDisplayPowerControl(on: boolean) {
+  return Buffer.from([10, on ? 1 : 0]);
+}
+
+export function encodeDeviceActionControl(action: DeviceActionName) {
+  if (action === 'expandNotifications') return Buffer.from([5]);
+  if (action === 'rotateDevice') return Buffer.from([11]);
+  throw new Error('设备动作无效');
+}
+
+function parseControlMessage(data: RawData): ControlMessage | undefined {
   try {
     const buffer = Array.isArray(data)
       ? Buffer.concat(data)
@@ -84,27 +187,81 @@ function parseTouchControl(data: RawData): TouchControl | undefined {
     const value: unknown = JSON.parse(buffer.toString('utf8'));
     if (!value || typeof value !== 'object') return;
     const item = value as Record<string, unknown>;
-    const actions: TouchAction[] = ['down', 'move', 'up', 'cancel'];
-    if (
-      item.type !== 'touch' ||
-      typeof item.action !== 'string' ||
-      !actions.includes(item.action as TouchAction)
-    )
-      return;
-    const numbers = ['pointerId', 'x', 'y', 'screenWidth', 'screenHeight'].map((key) => item[key]);
-    if (!numbers.every((value) => typeof value === 'number' && Number.isInteger(value))) return;
-    return {
-      action: item.action as TouchAction,
-      pointerId: numbers[0] as number,
-      x: numbers[1] as number,
-      y: numbers[2] as number,
-      screenWidth: numbers[3] as number,
-      screenHeight: numbers[4] as number,
-    };
+    if (item.type === 'touch') {
+      const actions: TouchAction[] = ['down', 'move', 'up', 'cancel'];
+      if (typeof item.action !== 'string' || !actions.includes(item.action as TouchAction)) return;
+      const numbers = ['pointerId', 'x', 'y', 'screenWidth', 'screenHeight'].map((key) => item[key]);
+      if (!numbers.every((num) => typeof num === 'number' && Number.isInteger(num))) return;
+      return {
+        type: 'touch',
+        action: item.action as TouchAction,
+        pointerId: numbers[0] as number,
+        x: numbers[1] as number,
+        y: numbers[2] as number,
+        screenWidth: numbers[3] as number,
+        screenHeight: numbers[4] as number,
+      };
+    }
+    if (item.type === 'key') {
+      if (typeof item.key !== 'string' || !Object.hasOwn(controlKeyCodes, item.key)) return;
+      return { type: 'key', key: item.key as ControlKeyName };
+    }
+    if (item.type === 'scroll') {
+      const ints = ['x', 'y', 'screenWidth', 'screenHeight'].map((key) => item[key]);
+      if (!ints.every((num) => typeof num === 'number' && Number.isInteger(num))) return;
+      if (typeof item.horizontal !== 'number' || typeof item.vertical !== 'number') return;
+      return {
+        type: 'scroll',
+        x: ints[0] as number,
+        y: ints[1] as number,
+        screenWidth: ints[2] as number,
+        screenHeight: ints[3] as number,
+        horizontal: item.horizontal,
+        vertical: item.vertical,
+      };
+    }
+    if (item.type === 'clipboard') {
+      if (typeof item.text !== 'string' || !item.text.length) return;
+      return { type: 'clipboard', text: item.text, paste: item.paste !== false };
+    }
+    if (item.type === 'displayPower') {
+      if (typeof item.on !== 'boolean') return;
+      return { type: 'displayPower', on: item.on };
+    }
+    if (item.type === 'action') {
+      if (item.action !== 'expandNotifications' && item.action !== 'rotateDevice') return;
+      return { type: 'action', action: item.action };
+    }
+    return;
   } catch {
     return;
   }
 }
+
+let cachedJarHash: { path: string; size: number; mtimeMs: number; hash: string } | undefined;
+
+function resolveRemoteJarPath(localPath: string, version: string) {
+  const safeVersion = version.replace(/[^A-Za-z0-9._-]/g, '_');
+  const stats = statSync(localPath);
+  if (
+    !cachedJarHash ||
+    cachedJarHash.path !== localPath ||
+    cachedJarHash.size !== stats.size ||
+    cachedJarHash.mtimeMs !== stats.mtimeMs
+  ) {
+    const hash = createHash('sha256').update(readFileSync(localPath)).digest('hex').slice(0, 8);
+    cachedJarHash = { path: localPath, size: stats.size, mtimeMs: stats.mtimeMs, hash };
+  }
+  return `/data/local/tmp/adb-console-server-${safeVersion}-${cachedJarHash.hash}.jar`;
+}
+
+const closeCodes: Record<string, { code: number; reason: string }> = {
+  'session replaced': { code: 4001, reason: 'session replaced' },
+  'viewer too slow': { code: 4002, reason: 'viewer too slow' },
+  'scrcpy exited': { code: 4003, reason: 'encoder exited' },
+  'scrcpy failed': { code: 4003, reason: 'encoder exited' },
+  'control overloaded': { code: 4004, reason: 'control overloaded' },
+};
 
 export class StreamSession {
   readonly id = randomUUID();
@@ -114,7 +271,7 @@ export class StreamSession {
   private tcp: net.Socket | undefined;
   private control: net.Socket | undefined;
   private controlReady = false;
-  private activeTouch: TouchControl | undefined;
+  private readonly activeTouches = new Map<number, TouchControl>();
   private stopped = false;
   private port: number | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
@@ -123,10 +280,10 @@ export class StreamSession {
   private stopPromise: Promise<void> | undefined;
   private attempts = 0;
   private receivedData = false;
-  private readonly socketId = this.id
-    .replaceAll('-', '')
-    .slice(0, 8)
-    .replace(/^[89a-f]/, '1');
+  private stderrTail = '';
+  private readonly socketId = (randomBytes(4).readUInt32BE(0) & 0x7fffffff || 1)
+    .toString(16)
+    .padStart(8, '0');
   deviceSize: { width: number; height: number } | undefined;
 
   constructor(
@@ -144,12 +301,23 @@ export class StreamSession {
     this.deviceSize = await this.adb.size(this.serial);
     try {
       if (this.stopped) throw new BadRequestException('投屏启动已取消');
-      await this.adb.run(
-        ['push', settings.scrcpyPath, '/data/local/tmp/adb-console-server.jar'],
-        this.serial,
-        30_000,
-      );
+      const remoteJar = resolveRemoteJarPath(settings.scrcpyPath, settings.scrcpyVersion);
+      let cached = false;
+      try {
+        const probe = await this.adb.run(
+          ['shell', 'test', '-s', remoteJar, '&&', 'echo', 'ok'],
+          this.serial,
+          5_000,
+        );
+        cached = probe?.stdout?.toString().trim() === 'ok';
+      } catch {
+        cached = false;
+      }
       if (this.stopped) throw new BadRequestException('投屏启动已取消');
+      if (!cached) {
+        await this.adb.run(['push', settings.scrcpyPath, remoteJar], this.serial, 30_000);
+        if (this.stopped) throw new BadRequestException('投屏启动已取消');
+      }
       const port = await this.adb.text(
         ['forward', 'tcp:0', `localabstract:scrcpy_${this.socketId}`],
         this.serial,
@@ -161,7 +329,7 @@ export class StreamSession {
       if (this.stopped) throw new BadRequestException('投屏启动已取消');
       this.process = this.adb.spawn(this.serial, [
         'shell',
-        `CLASSPATH=/data/local/tmp/adb-console-server.jar`,
+        `CLASSPATH=${remoteJar}`,
         'app_process',
         '/',
         'com.genymobile.scrcpy.Server',
@@ -180,12 +348,23 @@ export class StreamSession {
         `video_codec=${this.options.videoCodec ?? 'h264'}`,
       ]);
       this.process.stdout?.resume();
-      this.process.stderr?.resume();
-      this.process.once('error', () => {
+      this.process.stderr?.on('data', (chunk: Buffer) => {
+        this.stderrTail = (this.stderrTail + chunk.toString('utf8')).slice(-4096);
+      });
+      this.process.once('error', (error) => {
+        if (!this.stopped) {
+          console.warn(`[stream] scrcpy spawn error (${this.serial}): ${error.message.slice(0, 200)}`);
+        }
         void this.stop('scrcpy failed');
       });
-      this.process.once('exit', () => {
-        if (!this.stopped) void this.stop('scrcpy exited');
+      this.process.once('exit', (code, signal) => {
+        if (!this.stopped) {
+          const detail = this.stderrTail.replace(/\s+/g, ' ').trim().slice(-300);
+          console.warn(
+            `[stream] scrcpy exited (${this.serial}, code=${code ?? 'null'}, signal=${signal ?? 'null'})${detail ? `: ${detail}` : ''}`,
+          );
+          void this.stop('scrcpy exited');
+        }
       });
       this.scheduleIdleStop();
     } catch (error) {
@@ -220,12 +399,12 @@ export class StreamSession {
     }, 15_000);
     this.heartbeatTimer.unref();
     socket.on('message', (data, isBinary) => {
-      const event = isBinary ? undefined : parseTouchControl(data);
+      const event = isBinary ? undefined : parseControlMessage(data);
       if (!event) {
         void this.stop('invalid control message');
         return;
       }
-      this.sendTouch(event);
+      this.sendControl(event);
     });
     if (!this.tcp) void this.connectVideo();
   }
@@ -249,9 +428,10 @@ export class StreamSession {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    const closeInfo = closeCodes[reason];
     for (const client of this.clients) {
-      if (reason === 'session replaced' && client.readyState === 1) {
-        client.close(4001, 'session replaced');
+      if (closeInfo && client.readyState === 1 && typeof client.close === 'function') {
+        client.close(closeInfo.code, closeInfo.reason);
         const timer = setTimeout(() => client.terminate(), 1000);
         timer.unref();
         client.once('close', () => clearTimeout(timer));
@@ -261,11 +441,14 @@ export class StreamSession {
     this.tcp?.destroy();
     this.tcp = undefined;
     const control = this.control;
-    if (this.activeTouch && this.controlReady && control?.writable) {
-      control.end(encodeTouchControl({ ...this.activeTouch, action: 'up' }));
+    if (this.activeTouches.size && this.controlReady && control?.writable) {
+      const releases = [...this.activeTouches.values()].map((touch) =>
+        encodeTouchControl({ ...touch, action: 'up' }),
+      );
+      control.end(Buffer.concat(releases));
       control.setTimeout(1000, () => control.destroy());
     } else this.control?.destroy();
-    this.activeTouch = undefined;
+    this.activeTouches.clear();
     this.controlReady = false;
     this.control = undefined;
     this.process?.kill();
@@ -340,7 +523,7 @@ export class StreamSession {
     });
   }
 
-  private sendTouch(event: TouchControl) {
+  private sendControl(event: ControlMessage) {
     if (
       !this.controlReady ||
       !this.control ||
@@ -350,17 +533,36 @@ export class StreamSession {
     )
       return;
     try {
-      const message = encodeTouchControl(event);
-      if (event.action === 'down' ? !!this.activeTouch : this.activeTouch?.pointerId !== event.pointerId)
-        return;
+      let message: Buffer;
+      if (event.type === 'touch') {
+        message = encodeTouchControl(event);
+        if (event.action === 'down') {
+          if (this.activeTouches.has(event.pointerId) || this.activeTouches.size >= 10) return;
+        } else if (!this.activeTouches.has(event.pointerId)) {
+          return;
+        }
+      } else if (event.type === 'key') {
+        message = encodeKeyControl(event);
+      } else if (event.type === 'scroll') {
+        message = encodeScrollControl(event);
+      } else if (event.type === 'clipboard') {
+        message = encodeClipboardControl(event);
+      } else if (event.type === 'displayPower') {
+        message = encodeDisplayPowerControl(event.on);
+      } else {
+        message = encodeDeviceActionControl(event.action);
+      }
       if (this.control.writableLength > 64 * 1024) {
         void this.stop('control overloaded');
         return;
       }
       this.control.write(message);
-      this.activeTouch = event.action === 'up' || event.action === 'cancel' ? undefined : event;
+      if (event.type === 'touch') {
+        if (event.action === 'up' || event.action === 'cancel') this.activeTouches.delete(event.pointerId);
+        else this.activeTouches.set(event.pointerId, event);
+      }
     } catch {
-      void this.stop('invalid touch');
+      void this.stop('invalid control');
     }
   }
 
@@ -500,6 +702,13 @@ export class StreamService implements OnModuleDestroy {
 @UseGuards(AuthGuard)
 class StreamController {
   constructor(private readonly streams: StreamService) {}
+  @Get('config') config() {
+    return {
+      maxSize: settings.streamMaxSize,
+      maxFps: settings.streamMaxFps,
+      bitRate: settings.streamBitRate,
+    };
+  }
   @Post() async start(@Body() body: StartStreamDto, @Req() request: AuthRequest) {
     const session = await this.streams.start(body.serial, request.session.id, body);
     return session.summary();

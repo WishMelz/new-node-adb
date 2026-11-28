@@ -16,7 +16,8 @@ import {
   Post,
   Res,
 } from '@nestjs/common';
-import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
 import { IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import '@fastify/cookie';
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -24,6 +25,12 @@ import { toDataURL } from 'qrcode';
 import { loadPassword, settings } from './config';
 import { MAX_TRUST_DAYS, TRUST_COOKIE, TwoFactorService } from './two-factor';
 import { StorageModule, StorageService } from './storage';
+
+const scryptAsync = promisify(scrypt) as (
+  password: string | Buffer,
+  salt: string | Buffer,
+  keylen: number,
+) => Promise<Buffer>;
 
 export const COOKIE = 'adb_session';
 export interface LoginSession {
@@ -37,6 +44,7 @@ export class AuthService {
   private readonly salt = randomBytes(32);
   private readonly passwordHash: Buffer;
   private readonly configuredPassword = loadPassword();
+  private cachedSessionKey?: { material: string; key: Buffer };
   private readonly failures = new Map<string, { count: number; until: number }>();
   private readonly challenges = new Map<
     string,
@@ -56,12 +64,88 @@ export class AuthService {
     return this.configuredPassword || this.store.adminAccount() ? 'password' : 'register';
   }
 
+  get canChangePassword() {
+    return !this.configuredPassword && !!this.store.adminAccount();
+  }
+
+  async changePasswordAsync(
+    currentPassword: string,
+    newPassword: string,
+    confirmation: string,
+    code: string,
+    ip: string,
+  ) {
+    if (!this.canChangePassword) {
+      throw new BadRequestException('当前密码由环境变量配置管理，请修改配置并重启服务');
+    }
+    if (newPassword !== confirmation) throw new BadRequestException('两次输入的新密码不一致');
+    await this.verifyPasswordAsync(currentPassword, ip, true);
+    const salt = randomBytes(32);
+    const passwordHash = await scryptAsync(newPassword, salt, 32);
+    this.store.transaction((database) => {
+      if (this.factor.enabled && !this.factor.verify(code)) {
+        this.failAttempt(ip);
+        throw new BadRequestException('密码或验证码不正确、已使用或已过期');
+      }
+      this.failures.delete(ip);
+      database
+        .prepare('UPDATE admin_account SET passwordSalt = ?, passwordHash = ? WHERE singleton = 1')
+        .run(salt.toString('base64'), passwordHash.toString('base64'));
+      database.exec('DELETE FROM sessions');
+      if (this.factor.enabled) {
+        this.factor.resetAfterPasswordChange();
+      }
+    });
+    this.cachedSessionKey = undefined;
+    this.challenges.clear();
+  }
+
+  changePassword(
+    currentPassword: string,
+    newPassword: string,
+    confirmation: string,
+    code: string,
+    ip: string,
+  ) {
+    if (!this.canChangePassword) {
+      throw new BadRequestException('当前密码由环境变量配置管理，请修改配置并重启服务');
+    }
+    if (newPassword !== confirmation) throw new BadRequestException('两次输入的新密码不一致');
+    const salt = randomBytes(32);
+    const passwordHash = scryptSync(newPassword, salt, 32);
+    this.store.transaction((database) => {
+      this.checkSecurity(currentPassword, code, ip);
+      database
+        .prepare('UPDATE admin_account SET passwordSalt = ?, passwordHash = ? WHERE singleton = 1')
+        .run(salt.toString('base64'), passwordHash.toString('base64'));
+      database.exec('DELETE FROM sessions');
+      if (this.factor.enabled) {
+        this.factor.resetAfterPasswordChange();
+      }
+    });
+    this.cachedSessionKey = undefined;
+    this.challenges.clear();
+  }
+
+  async registerAsync(password: string, confirmation: string, ip: string) {
+    if (this.mode() === 'password') throw new ConflictException('管理员已注册，请直接登录');
+    if (password !== confirmation) throw new BadRequestException('两次输入的密码不一致');
+    this.checkAttempt(ip);
+    const salt = randomBytes(32);
+    const passwordHash = await scryptAsync(password, salt, 32);
+    return this.commitRegistration(salt, passwordHash, ip);
+  }
+
   register(password: string, confirmation: string, ip: string) {
     if (this.mode() === 'password') throw new ConflictException('管理员已注册，请直接登录');
     if (password !== confirmation) throw new BadRequestException('两次输入的密码不一致');
     this.checkAttempt(ip);
     const salt = randomBytes(32);
     const passwordHash = scryptSync(password, salt, 32);
+    return this.commitRegistration(salt, passwordHash, ip);
+  }
+
+  private commitRegistration(salt: Buffer, passwordHash: Buffer, ip: string) {
     const token = randomBytes(32).toString('base64url');
     const session = {
       id: randomBytes(16).toString('hex'),
@@ -90,9 +174,19 @@ export class AuthService {
     return this.createSession();
   }
 
+  async beginLoginAsync(password: string, ip: string, trustedToken?: string) {
+    if (this.mode() === 'register') throw new ConflictException('请先注册管理员');
+    await this.verifyPasswordAsync(password, ip, false);
+    return this.finishBeginLogin(ip, trustedToken);
+  }
+
   beginLogin(password: string, ip: string, trustedToken?: string) {
     if (this.mode() === 'register') throw new ConflictException('请先注册管理员');
     this.checkPassword(password, ip);
+    return this.finishBeginLogin(ip, trustedToken);
+  }
+
+  private finishBeginLogin(ip: string, trustedToken?: string) {
     if (!this.factor.enabled || this.factor.isTrusted(trustedToken)) {
       this.failures.delete(ip);
       return this.createSession();
@@ -134,6 +228,28 @@ export class AuthService {
     this.challenges.delete(key);
     this.failures.delete(ip);
     return result;
+  }
+
+  async changeFactorAsync(password: string, code: string, ip: string, action: 'disable' | 'revoke-trusted') {
+    await this.verifyPasswordAsync(password, ip, true);
+    this.store.transaction(() => {
+      if (this.factor.enabled && !this.factor.verify(code)) {
+        this.failAttempt(ip);
+        throw new BadRequestException('密码或验证码不正确、已使用或已过期');
+      }
+      this.failures.delete(ip);
+      if (action === 'disable') this.factor.disable();
+      else this.factor.revokeTrusted();
+    });
+  }
+
+  async checkSecurityAsync(password: string, code: string, ip: string) {
+    await this.verifyPasswordAsync(password, ip, true);
+    if (this.factor.enabled && !this.factor.verify(code)) {
+      this.failAttempt(ip);
+      throw new BadRequestException('密码或验证码不正确、已使用或已过期');
+    }
+    this.failures.delete(ip);
   }
 
   changeFactor(password: string, code: string, ip: string, action: 'disable' | 'revoke-trusted') {
@@ -188,6 +304,27 @@ export class AuthService {
     attempt.count += 1;
     this.failures.set(ip, attempt);
   }
+  private async verifyPasswordAsync(password: string, ip: string, securityContext: boolean) {
+    this.checkAttempt(ip);
+    const account = this.store.adminAccount();
+    if (!this.configuredPassword && !account) throw new ConflictException('请先注册管理员');
+    const expected = this.configuredPassword
+      ? this.passwordHash
+      : account
+        ? Buffer.from(account.passwordHash, 'base64')
+        : Buffer.alloc(0);
+    const actual = this.configuredPassword
+      ? await scryptAsync(password, this.salt, 32)
+      : account
+        ? await scryptAsync(password, Buffer.from(account.passwordSalt, 'base64'), 32)
+        : Buffer.alloc(0);
+    if (expected.length !== actual.length || !timingSafeEqual(actual, expected)) {
+      this.failAttempt(ip);
+      throw securityContext
+        ? new BadRequestException('密码或验证码不正确')
+        : new UnauthorizedException('访问密码不正确');
+    }
+  }
   private checkPassword(password: string, ip: string) {
     this.checkAttempt(ip);
     const account = this.store.adminAccount();
@@ -232,11 +369,13 @@ export class AuthService {
   }
 
   find(token?: string): LoginSession | undefined {
-    if (!token || this.mode() === 'register') return;
+    if (!token) return;
     return this.store.read((database) => {
+      const material = this.sessionMaterial();
+      if (!material) return undefined;
       const session = database
         .prepare('SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND expiresAt > ?')
-        .get(this.hash(token), Date.now());
+        .get(this.hashWithMaterial(token, material), Date.now());
       return session ? { id: String(session.id), expiresAt: Number(session.expiresAt) } : undefined;
     });
   }
@@ -248,13 +387,24 @@ export class AuthService {
       });
   }
   private hash(token: string) {
-    return createHmac('sha256', this.sessionKey()).update(token).digest('hex');
+    const material = this.sessionMaterial();
+    if (!material) throw new ConflictException('请先注册管理员');
+    return this.hashWithMaterial(token, material);
   }
-  private sessionKey() {
-    if (this.configuredPassword) return scryptSync(this.configuredPassword, 'adb-session-store-v1', 32);
+  private hashWithMaterial(token: string, material: string) {
+    return createHmac('sha256', this.deriveSessionKey(material)).update(token).digest('hex');
+  }
+  private sessionMaterial() {
+    if (this.configuredPassword) return `env:${this.configuredPassword}`;
     const account = this.store.adminAccount();
-    if (!account) throw new ConflictException('请先注册管理员');
-    return scryptSync(account.passwordHash, 'adb-session-store-v1', 32);
+    return account ? `db:${account.passwordHash}` : undefined;
+  }
+  private deriveSessionKey(material: string) {
+    if (this.cachedSessionKey?.material === material) return this.cachedSessionKey.key;
+    const raw = material.slice(material.indexOf(':') + 1);
+    const key = scryptSync(raw, 'adb-session-store-v1', 32);
+    this.cachedSessionKey = { material, key };
+    return key;
   }
 }
 
@@ -286,6 +436,12 @@ export class VerifyLoginDto {
 class SecurityDto extends LoginDto {
   @IsOptional() @IsString() @MaxLength(20) code?: string;
 }
+export class ChangePasswordDto {
+  @IsString() @MinLength(1) currentPassword!: string;
+  @IsString() @MinLength(1) newPassword!: string;
+  @IsString() @MinLength(1) confirmPassword!: string;
+  @IsOptional() @IsString() @MaxLength(20) code?: string;
+}
 class EnableFactorDto {
   @IsString() @MinLength(6) @MaxLength(6) code!: string;
 }
@@ -311,13 +467,16 @@ class AuthController {
   @Get('two-factor')
   @UseGuards(AuthGuard)
   security(@Req() request: AuthRequest) {
-    return this.factor.status(request.cookies[TRUST_COOKIE]);
+    return {
+      ...this.factor.status(request.cookies[TRUST_COOKIE]),
+      canChangePassword: this.auth.canChangePassword,
+    };
   }
 
   @Post('two-factor/setup')
   @UseGuards(AuthGuard)
   async setup(@Body() body: LoginDto, @Req() request: AuthRequest) {
-    this.auth.checkSecurity(body.password, '', request.ip);
+    await this.auth.checkSecurityAsync(body.password, '', request.ip);
     const setup = this.factor.begin(request.session.id);
     return { ...setup, qrCode: await toDataURL(setup.uri, { width: 240, margin: 2 }) };
   }
@@ -330,24 +489,24 @@ class AuthController {
 
   @Post('two-factor/disable')
   @UseGuards(AuthGuard)
-  disable(
+  async disable(
     @Body() body: SecurityDto,
     @Req() request: AuthRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
   ) {
-    this.auth.changeFactor(body.password, body.code || '', request.ip, 'disable');
+    await this.auth.changeFactorAsync(body.password, body.code || '', request.ip, 'disable');
     reply.clearCookie(TRUST_COOKIE, { path: '/api/auth' });
     return { ok: true };
   }
 
   @Post('two-factor/revoke-trusted')
   @UseGuards(AuthGuard)
-  revokeTrusted(
+  async revokeTrusted(
     @Body() body: SecurityDto,
     @Req() request: AuthRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
   ) {
-    this.auth.changeFactor(body.password, body.code || '', request.ip, 'revoke-trusted');
+    await this.auth.changeFactorAsync(body.password, body.code || '', request.ip, 'revoke-trusted');
     reply.clearCookie(TRUST_COOKIE, { path: '/api/auth' });
     return { ok: true };
   }

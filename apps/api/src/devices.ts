@@ -10,6 +10,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Res,
   UseGuards,
 } from '@nestjs/common';
@@ -126,6 +127,11 @@ class HostDto {
   @Matches(/^(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9a-fA-F:]+\]):\d{1,5}$/, { message: hostFormatMessage })
   host!: string;
 }
+class PairDto extends HostDto {
+  @IsString({ message: '请输入 6 位数字配对码' })
+  @Matches(/^\d{6}$/, { message: '请输入 6 位数字配对码' })
+  code!: string;
+}
 class TapDto extends DeviceDto {
   @IsInt() @Min(0) @Max(16383) x!: number;
   @IsInt() @Min(0) @Max(16383) y!: number;
@@ -191,6 +197,14 @@ class DevicesController {
     this.records.remember(body.host);
     return { message };
   }
+  @Post('pair') async pair(@Body() body: PairDto) {
+    const port = Number(body.host.slice(body.host.lastIndexOf(':') + 1));
+    if (port < 1 || port > 65535) throw new BadRequestException('端口号必须在 1-65535 之间');
+    const message = await this.adb.text(['pair', body.host, body.code]);
+    if (!/successfully paired/i.test(message))
+      throw new BadRequestException(message || '无线配对失败，请检查地址、端口和配对码');
+    return { message };
+  }
   @Post('disconnect') async disconnect(@Body() body: DeviceDto) {
     if (!body.serial.includes(':') && !body.serial.includes('_tcp'))
       throw new BadRequestException('USB 设备请直接拔出连接线');
@@ -203,9 +217,40 @@ class DevicesController {
     if (!address) throw new BadRequestException('无法识别网络地址');
     return { host: `${address}:5555` };
   }
-  @Get(':serial/screenshot') async screenshot(@Param('serial') serial: string, @Res() reply: FastifyReply) {
-    const image = await this.adb.screenshot(serial);
-    reply.header('Cache-Control', 'no-store').type('image/webp').send(image);
+  @Get(':serial/apps') async apps(@Param('serial') serial: string) {
+    await this.adb.ready(serial);
+    const output = await this.adb.text(['shell', 'pm', 'list', 'packages', '-3'], serial);
+    const packages = [
+      ...new Set(
+        output
+          .split(/\r?\n/)
+          .map((line) => line.trim().replace(/^package:/, ''))
+          .filter((name) => /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(name)),
+      ),
+    ]
+      .sort((a, b) => a.localeCompare(b))
+      .slice(0, 500);
+    return { packages };
+  }
+  @Get(':serial/screenshot') async screenshot(
+    @Param('serial') serial: string,
+    @Query('maxSize') maxSize: string | undefined,
+    @Res() reply: FastifyReply,
+  ) {
+    let limit: number | undefined;
+    if (maxSize !== undefined && maxSize !== '') {
+      const parsed = Number(maxSize);
+      if (!Number.isSafeInteger(parsed) || parsed < 320 || parsed > 1920)
+        throw new BadRequestException('maxSize 必须为 320-1920 的整数');
+      limit = parsed;
+    }
+    const frame = await this.adb.screenshotFrame(serial, limit);
+    reply.header('Cache-Control', 'no-store');
+    if (frame.width && frame.height) {
+      reply.header('X-Device-Width', String(frame.width));
+      reply.header('X-Device-Height', String(frame.height));
+    }
+    reply.type('image/webp').send(frame.buffer);
   }
   @Post('tap') async tap(@Body() body: TapDto) {
     await this.adb.ready(body.serial);

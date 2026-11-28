@@ -11,6 +11,7 @@ const DAY = 86_400_000;
 @Injectable()
 export class TwoFactorService {
   private pending?: { secret: string; sessionId: string; expiresAt: number };
+  private cachedKey?: { material: string; key: Buffer };
 
   constructor(readonly store: StorageService = new StorageService()) {}
 
@@ -25,16 +26,20 @@ export class TwoFactorService {
     return this.state.version;
   }
   status(token?: string) {
-    const current = this.state.trusted.find(
-      (entry) => entry.hash === this.hash(token || '') && entry.expiresAt > Date.now(),
-    );
-    return {
-      enabled: this.enabled,
-      maxTrustDays: MAX_TRUST_DAYS,
-      trustedBrowsers: this.state.trusted.filter((entry) => entry.expiresAt > Date.now()).length,
-      trustedUntil: current?.expiresAt ?? null,
-      recoveryCodesRemaining: this.state.recovery.length,
-    };
+    return this.store.read(() => {
+      const state = this.state;
+      const now = Date.now();
+      const targetHash = token ? this.hash(token) : undefined;
+      const activeTrusted = state.trusted.filter((entry) => entry.expiresAt > now);
+      const current = targetHash ? activeTrusted.find((entry) => entry.hash === targetHash) : undefined;
+      return {
+        enabled: !!state.secret,
+        maxTrustDays: MAX_TRUST_DAYS,
+        trustedBrowsers: activeTrusted.length,
+        trustedUntil: current?.expiresAt ?? null,
+        recoveryCodesRemaining: state.recovery.length,
+      };
+    });
   }
 
   begin(sessionId: string) {
@@ -77,8 +82,9 @@ export class TwoFactorService {
       if (step !== null) {
         this.persist({ ...state, lastStep: step });
       } else {
+        if (!/^[a-f0-9]{20}$/.test(code)) return false;
         const index = state.recovery.indexOf(this.hash(code));
-        if (!/^[a-f0-9]{20}$/.test(code) || index === -1) return false;
+        if (index === -1) return false;
         this.persist({
           ...state,
           recovery: state.recovery.filter((_, position) => position !== index),
@@ -89,11 +95,14 @@ export class TwoFactorService {
   }
 
   isTrusted(token?: string) {
-    return (
-      this.enabled &&
-      !!token &&
-      this.state.trusted.some((entry) => entry.hash === this.hash(token) && entry.expiresAt > Date.now())
-    );
+    if (!token) return false;
+    return this.store.read(() => {
+      const state = this.state;
+      if (!state.secret) return false;
+      const targetHash = this.hash(token);
+      const now = Date.now();
+      return state.trusted.some((entry) => entry.hash === targetHash && entry.expiresAt > now);
+    });
   }
 
   remember(days: number) {
@@ -113,6 +122,18 @@ export class TwoFactorService {
     this.store.transaction(() => {
       this.persist({ ...this.state, trusted: [], version: randomBytes(16).toString('hex') });
     });
+  }
+
+  resetAfterPasswordChange() {
+    this.store.transaction(() => {
+      this.persist({
+        ...this.state,
+        recovery: [],
+        trusted: [],
+        version: randomBytes(16).toString('hex'),
+      });
+    });
+    this.cachedKey = undefined;
   }
 
   disable() {
@@ -145,12 +166,21 @@ export class TwoFactorService {
   }
   private hash(value: string) {
     const password = loadPassword();
-    const account = this.store.adminAccount();
-    const key = password
-      ? scryptSync(password, 'adb-two-factor-v1', 32)
-      : account
-        ? scryptSync(account.passwordHash, 'adb-two-factor-v1', 32)
-        : randomBytes(32);
+    const material = password
+      ? `env:${password}`
+      : (() => {
+          const account = this.store.adminAccount();
+          return account ? `db:${account.passwordHash}` : undefined;
+        })();
+    let key: Buffer;
+    if (!material) {
+      key = randomBytes(32);
+    } else if (this.cachedKey?.material === material) {
+      key = this.cachedKey.key;
+    } else {
+      key = scryptSync(material.slice(material.indexOf(':') + 1), 'adb-two-factor-v1', 32);
+      this.cachedKey = { material, key };
+    }
     return createHmac('sha256', key).update(value).digest('hex');
   }
   private persist(next: FactorState) {

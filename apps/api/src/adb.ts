@@ -64,6 +64,10 @@ export class AdbService implements BeforeApplicationShutdown {
   private socket?: string;
   private environment?: NodeJS.ProcessEnv;
   private closing = false;
+  private readonly pendingScreenshots = new Map<
+    string,
+    Promise<{ buffer: Buffer; width?: number; height?: number }>
+  >();
 
   private async ensureServer() {
     if (this.closing) throw new ServiceUnavailableException('ADB 服务正在关闭');
@@ -138,10 +142,14 @@ export class AdbService implements BeforeApplicationShutdown {
         };
         connect();
       });
-    } catch {
+    } catch (error) {
       this.server?.kill();
       this.server = undefined;
       this.socket = undefined;
+      if (!this.closing) {
+        const detail = error instanceof Error ? error.message.slice(0, 200) : 'unknown error';
+        console.warn(`[adb] server initialization failed: ${detail}`);
+      }
       throw new ServiceUnavailableException(
         '无法初始化项目 ADB，请检查 ADB_PATH、DATA_DIR 权限及 .android 密钥；不会覆盖已有密钥',
       );
@@ -207,10 +215,30 @@ export class AdbService implements BeforeApplicationShutdown {
   async size(serial: string) {
     return parseSize(await this.text(['shell', 'wm', 'size'], serial));
   }
-  async screenshot(serial: string) {
-    await this.ready(serial);
-    const result = await this.run(['exec-out', 'screencap', '-p'], serial);
-    return sharp(result.stdout).webp({ quality: 82, effort: 1 }).toBuffer();
+  async screenshot(serial: string, maxSize?: number) {
+    return (await this.screenshotFrame(serial, maxSize)).buffer;
+  }
+  async screenshotFrame(serial: string, maxSize?: number) {
+    validateSerial(serial);
+    const key = `${serial}:${maxSize ?? 0}`;
+    const existing = this.pendingScreenshots.get(key);
+    if (existing) return existing;
+    const capture = (async () => {
+      await this.ready(serial);
+      const result = await this.run(['exec-out', 'screencap', '-p'], serial);
+      const image = sharp(result.stdout);
+      const metadata = await image.metadata();
+      const pipeline = maxSize
+        ? image
+            .resize({ width: maxSize, height: maxSize, fit: 'inside', withoutEnlargement: true })
+            .webp({ quality: 78, effort: 1 })
+        : image.webp({ quality: 82, effort: 1 });
+      return { buffer: await pipeline.toBuffer(), width: metadata.width, height: metadata.height };
+    })().finally(() => {
+      if (this.pendingScreenshots.get(key) === capture) this.pendingScreenshots.delete(key);
+    });
+    this.pendingScreenshots.set(key, capture);
+    return capture;
   }
   spawn(serial: string, args: string[]) {
     validateSerial(serial);

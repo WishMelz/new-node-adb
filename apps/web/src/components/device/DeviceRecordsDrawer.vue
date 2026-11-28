@@ -63,7 +63,13 @@ function saveNote(record: DeviceRecord) {
 </script>
 
 <template>
-  <t-drawer v-model:visible="visible" :footer="false" size="min(440px, 100vw)">
+  <t-drawer
+    v-model:visible="visible"
+    :footer="false"
+    :close-btn="false"
+    destroy-on-close
+    size="min(440px, 100vw)"
+  >
     <template #header>
       <div class="drawer-header">
         <span>已保存设备</span>
@@ -74,7 +80,7 @@ function saveNote(record: DeviceRecord) {
     </template>
     <div class="records-toolbar">
       <span>{{ records.length }} 台设备</span
-      ><t-tooltip content="刷新记录"
+      ><t-tooltip content="刷新记录" destroy-on-close
         ><t-button
           shape="square"
           variant="text"
@@ -176,6 +182,7 @@ function saveNote(record: DeviceRecord) {
     role="dialog"
     aria-modal="true"
     aria-label="删除设备记录"
+    destroy-on-close
     :visible="!!pendingDelete"
     header="删除设备记录"
     :confirm-btn="{ content: '删除记录', theme: 'danger', loading: !!deleting }"

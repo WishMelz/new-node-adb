@@ -22,9 +22,13 @@ export function useWorkspace(cancel: () => void, pageLeaving: () => void) {
     cancel()
     try {
       if (expanded.value || document.fullscreenElement) await leaveFullscreen()
-      else if (workspace.value?.requestFullscreen && document.fullscreenEnabled)
-        await workspace.value.requestFullscreen()
-      else expanded.value = true
+      else if (workspace.value?.requestFullscreen && document.fullscreenEnabled) {
+        await Promise.race([
+          workspace.value.requestFullscreen(),
+          new Promise((resolve) => setTimeout(resolve, 250)),
+        ])
+        if (document.fullscreenElement !== workspace.value) expanded.value = true
+      } else expanded.value = true
     } catch {
       expanded.value = !expanded.value
     }
